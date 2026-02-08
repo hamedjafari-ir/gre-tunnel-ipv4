@@ -15,39 +15,23 @@ warn() { echo -e "${YELLOW}WARNING:${NC} $*"; }
 need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo). Example: sudo ./gre-tunnel-wizard.sh"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# ---------- ASCII Header ----------
+# ---------- Banner ----------
 print_banner() {
   clear
   echo -e "${CYAN}"
   cat <<'EOF'
-   _____  ____  ______   _______                 _  _   _           _
-  / ____|/ __ \|  ____| |__   __|               | || | (_)         | |
- | |  __| |  | | |__       | | _   _ _ __  _ __ | || |_ _ _ __   __| |
- | | |_ | |  | |  __|      | || | | | '_ \| '_ \|__   _| | '_ \ / _` |
- | |__| | |__| | |____     | || |_| | | | | | | |  | | | | | | | (_| |
-  \_____|\____/|______|    |_| \__,_|_| |_|_| |_|  |_| |_|_| |_|\__,_|
+   ________  _______   ________      _________                    __
+  / ____/ / / / ____/ /_  __/ /_  __/ ____/ /___  ____  ___  ____/ /
+ / / __/ /_/ / __/     / / / / / / / __/ / / __ \/ __ \/ _ \/ __  /
+/ /_/ / __  / /___    / / / / /_/ / /___/ / /_/ / /_/ /  __/ /_/ /
+\____/_/ /_/_____/   /_/ /_/\__, /_____/_/\____/\____/\___/\__,_/
+                           /____/
 
 EOF
   echo -e "${NC}"
   echo "GRE Tunnel Wizard (IPv4)  |  Created by: Hamed Jafari"
   echo
 }
-
-# ---------- SSH options (no prompts) ----------
-KNOWN_HOSTS_TMP="/tmp/gre_tunnel_known_hosts"
-SSH_OPTS_COMMON=(
-  -o StrictHostKeyChecking=no
-  -o UserKnownHostsFile="$KNOWN_HOSTS_TMP"
-  -o GlobalKnownHostsFile=/dev/null
-  -o LogLevel=ERROR
-  -o ConnectionAttempts=1
-  -o ConnectTimeout=5
-  -o ServerAliveInterval=2
-  -o ServerAliveCountMax=1
-  -o GSSAPIAuthentication=no
-  -o KbdInteractiveAuthentication=no
-  -o ChallengeResponseAuthentication=no
-)
 
 # ---------- Spinner ----------
 SPINNER_PID=""
@@ -126,16 +110,30 @@ ensure_local_deps() {
   fi
 }
 
-# ---------- network checks ----------
+# ---------- SSH options (no prompts) ----------
+KNOWN_HOSTS_TMP="/tmp/gre_tunnel_known_hosts"
+SSH_OPTS_COMMON=(
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile="$KNOWN_HOSTS_TMP"
+  -o GlobalKnownHostsFile=/dev/null
+  -o LogLevel=ERROR
+  -o ConnectionAttempts=1
+  -o ConnectTimeout=5
+  -o ServerAliveInterval=2
+  -o ServerAliveCountMax=1
+  -o GSSAPIAuthentication=no
+  -o KbdInteractiveAuthentication=no
+  -o ChallengeResponseAuthentication=no
+)
+
+# ---------- checks ----------
 check_tcp_port() {
   local host="$1" port="$2"
   timeout 5 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1
 }
 
-# ---------- SSH runners ----------
 ssh_run_password() {
   local host="$1" port="$2" user="$3" pass="$4" remote="$5"
-  # Non-interactive, fail fast
   timeout 12 sshpass -p "$pass" ssh -p "$port" \
     "${SSH_OPTS_COMMON[@]}" \
     -o BatchMode=yes \
@@ -239,7 +237,6 @@ configure_gre_ipv4() {
   echo "  SSH        : $SSH_USER@$KHAREJ_IP:$SSH_PORT"
   echo
 
-  # 1) TCP check
   spinner_start "Checking TCP connectivity to Kharej:$SSH_PORT"
   if ! check_tcp_port "$KHAREJ_IP" "$SSH_PORT"; then
     spinner_stop_fail "Checking TCP connectivity to Kharej:$SSH_PORT"
@@ -247,22 +244,24 @@ configure_gre_ipv4() {
   fi
   spinner_stop_ok "TCP port reachable"
 
-  # 2) SSH login check (fast)
+  if [[ -z "${SSH_PASS:-}" ]]; then
+    warn "You left password empty => script will use SSH KEY auth."
+    warn "Make sure Iran server has a valid SSH key for $SSH_USER@$KHAREJ_IP."
+  fi
+
   spinner_start "Checking SSH login (non-interactive)"
   if ! ssh_login_check "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS"; then
     spinner_stop_fail "Checking SSH login (non-interactive)"
     echo
     echo -e "${YELLOW}What to check on Kharej server:${NC}"
-    echo "  - Is root login allowed?  (PermitRootLogin yes)"
-    echo "  - If using password:      (PasswordAuthentication yes)"
-    echo "  - If using key:           add your public key to ~/.ssh/authorized_keys"
-    echo "  - Verify credentials / username"
+    echo "  - PermitRootLogin yes (if using root user)"
+    echo "  - PasswordAuthentication yes (if using password)"
+    echo "  - If using SSH key: authorized_keys must contain your public key"
     echo
     die "SSH login failed. Check credentials / SSH key / root login settings."
   fi
   spinner_stop_ok "SSH login OK"
 
-  # 3) Remote GRE config (Kharej)
   local remote_cmd
   remote_cmd=$(
     cat <<'EOF'
@@ -274,7 +273,6 @@ else
   SUDO=""
 fi
 
-# Ensure ip exists
 if ! command -v ip >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     $SUDO apt-get update -y >/dev/null 2>&1 || true
@@ -285,7 +283,6 @@ if ! command -v ip >/dev/null 2>&1; then
   fi
 fi
 
-# Re-runnable
 $SUDO ip link show To_IR >/dev/null 2>&1 && $SUDO ip tunnel del To_IR >/dev/null 2>&1 || true
 
 $SUDO ip tunnel add To_IR mode gre remote <IP_IRAN> local <IP_KHAREJ> ttl 255
@@ -311,7 +308,6 @@ EOF
   rm -f "$out" 2>/dev/null || true
   spinner_stop_ok "Kharej configured"
 
-  # 4) Local GRE config (Iran)
   spinner_start "Configuring Iran GRE interface"
   del_tunnel_if_exists "To_Kharej"
   ip tunnel add To_Kharej mode gre remote "$KHAREJ_IP" local "$IRAN_IP" ttl 255
@@ -320,7 +316,6 @@ EOF
   ip link set To_Kharej up
   spinner_stop_ok "Iran GRE interface configured"
 
-  # 5) NAT / forwarding
   spinner_start "Enabling forwarding and NAT rules"
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   add_iptables_rule_once -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination 172.20.20.1
@@ -328,7 +323,6 @@ EOF
   add_iptables_rule_once -t nat -A POSTROUTING -j MASQUERADE
   spinner_stop_ok "Forwarding/NAT configured"
 
-  # 6) Test
   spinner_start "Testing tunnel (ping 172.20.20.2)"
   if ping -c 3 -W 2 172.20.20.2 >/dev/null 2>&1; then
     spinner_stop_ok "Tunnel OK"
