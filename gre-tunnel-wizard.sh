@@ -3,18 +3,23 @@ set -euo pipefail
 
 # ==========================================================
 # GRE Tunnel Wizard (IPv4) - Normal Servers + AWS EC2
-# Created by: Hamed Jafari
+# Created by: Hamed Jafari (refined)
 # Version: 1.6
 #
-# Modes:
-# 1) GRE link only (ping test)
-# 2) GRE + traffic forwarding (NAT/DNAT)  [like your working rules]
+# Features:
+# - Builds GRE link 172.20.20.0/30:
+#     Iran(local) 172.20.20.1  <-->  Kharej(remote) 172.20.20.2
+# - AWS-aware:
+#     Remote GRE "local" must be EC2 PRIVATE IPv4 (not public)
+#     Remote reachable for SSH = EC2 PUBLIC IPv4
+# - Optional traffic forwarding (real traffic pass):
+#     * Enables ip_forward
+#     * Adds NAT MASQUERADE rules (safe, scoped)
+# - Prompts cleanly (no duplicate password prompts)
 #
-# AWS notes (important):
-# - On EC2, GRE "local" must be the instance PRIVATE IPv4 (not Public).
-# - For traffic forwarding through EC2, often you must DISABLE Source/Dest Check.
-# - Security Group / NACL must allow GRE (Protocol 47) inbound/outbound as needed.
-# - rp_filter can drop asymmetric traffic; script disables it on both ends.
+# Local requirements:
+#   bash, ip, sysctl, ssh, nc, timeout, base64, ping, iptables
+#   sshpass optional (only if you use SSH password)
 # ==========================================================
 
 SCRIPT_VERSION="1.6"
@@ -25,7 +30,7 @@ info() { echo -e "${CYAN}$*${NC}"; }
 ok()   { echo -e "${GREEN}$*${NC}"; }
 warn() { echo -e "${YELLOW}WARNING:${NC} $*"; }
 
-need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root. Example: sudo ./gre-tunnel-wizard.sh"; }
+need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo). Example: sudo ./gre-tunnel-wizard.sh"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 # ---------- Banner ----------
@@ -33,19 +38,19 @@ print_banner() {
   clear
   echo -e "${CYAN}${BOLD}"
   cat <<'EOF'
-   ██████╗ ██████╗ ███████╗
-  ██╔════╝ ██╔══██╗██╔════╝
-  ██║  ███╗██████╔╝█████╗
-  ██║   ██║██╔══██╗██╔══╝
-  ╚██████╔╝██║  ██║███████╗
-   ╚═════╝ ╚═╝  ╚═╝╚══════╝
+  ██████╗ ██████╗ ███████╗
+ ██╔════╝ ██╔══██╗██╔════╝
+ ██║  ███╗██████╔╝█████╗
+ ██║   ██║██╔══██╗██╔══╝
+ ╚██████╔╝██║  ██║███████╗
+  ╚═════╝ ╚═╝  ╚═╝╚══════╝
 
-   ████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗
-   ╚══██╔══╝██║   ██║████╗  ██║████╗  ██║██╔════╝██║
-      ██║   ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██║
-      ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
-      ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
-      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
+  ████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗
+  ╚══██╔══╝██║   ██║████╗  ██║████╗  ██║██╔════╝██║
+     ██║   ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██║
+     ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
+     ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
+     ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
 EOF
   echo -e "${NC}"
   echo "GRE Tunnel Wizard (IPv4)  |  Created by: Hamed Jafari  |  Version: ${SCRIPT_VERSION}"
@@ -60,7 +65,7 @@ spinner_start() {
     local frames='-\|/'
     local i=0
     while true; do
-      printf "\r%-72s %s" "$msg" "${frames:i%4:1}"
+      printf "\r%-74s %s" "$msg" "${frames:i%4:1}"
       i=$((i+1))
       sleep 0.12
     done
@@ -75,7 +80,7 @@ spinner_stop_ok() {
     wait "$SPINNER_PID" >/dev/null 2>&1 || true
     SPINNER_PID=""
   fi
-  printf "\r%-72s ✓\n" "$msg"
+  printf "\r%-74s ✓\n" "$msg"
 }
 spinner_stop_fail() {
   local msg="$1"
@@ -84,7 +89,7 @@ spinner_stop_fail() {
     wait "$SPINNER_PID" >/dev/null 2>&1 || true
     SPINNER_PID=""
   fi
-  printf "\r%-72s ✗\n" "$msg"
+  printf "\r%-74s ✗\n" "$msg"
 }
 
 pause() { read -r -p "Press Enter to continue... " _; }
@@ -110,6 +115,13 @@ detect_local_ipv4() {
   echo "${ip:-}"
 }
 
+detect_default_iface() {
+  # interface used for default route
+  ip -4 route get 1.1.1.1 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+}
+
+is_bool() { [[ "${1:-}" == "true" || "${1:-}" == "false" ]]; }
+
 # ---------- deps ----------
 ensure_local_deps() {
   command_exists ip       || die "'ip' is missing (iproute2)."
@@ -119,13 +131,14 @@ ensure_local_deps() {
   command_exists nc       || die "'nc' is missing."
   command_exists timeout  || die "'timeout' is missing."
   command_exists base64   || die "'base64' is missing."
-  command_exists iptables || die "'iptables' is missing (needed for traffic mode)."
+  command_exists iptables || die "'iptables' is missing."
+  command_exists modprobe || warn "'modprobe' not found. Kernel module load might fail."
   if ! command_exists sshpass; then
     warn "'sshpass' not found. SSH password auth won't work (SSH key auth is fine)."
   fi
 }
 
-# ---------- SSH helpers ----------
+# ---------- SSH ----------
 KNOWN_HOSTS_TMP="/tmp/gre_tunnel_known_hosts.$$"
 cleanup() { rm -f "$KNOWN_HOSTS_TMP" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -194,14 +207,18 @@ ssh_login_check() {
   fi
 }
 
+# ---------- Remote payload runner (base64 + sudo -i) ----------
 run_remote_payload_b64_capture() {
   local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" payload="$6"
   local tmp; tmp="$(mktemp)"
-  local payload_b64; payload_b64="$(printf "%s" "$payload" | base64 -w0)"
+
+  local payload_b64
+  payload_b64="$(printf "%s" "$payload" | base64 -w0)"
 
   local remote_script
   remote_script="$(cat <<'RS'
 set -euo pipefail
+
 PAYLOAD_B64="$PAYLOAD_B64"
 SUDO_PASS="${SUDO_PASS:-}"
 
@@ -242,42 +259,47 @@ RS
 
   if [[ -n "${ssh_pass:-}" ]]; then
     if ! ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote_cmd" >"$tmp" 2>&1; then
-      echo "$tmp"; return 1
+      echo "$tmp"
+      return 1
     fi
   else
     if ! ssh_run_key "$host" "$port" "$user" "$remote_cmd" >"$tmp" 2>&1; then
-      echo "$tmp"; return 1
+      echo "$tmp"
+      return 1
     fi
   fi
 
   echo "$tmp"
 }
 
-# ---------- idempotent helpers ----------
+# ---------- iptables helper ----------
+iptables_add_once() {
+  # usage: iptables_add_once <table> <rule...>
+  local table="$1"; shift
+  iptables -t "$table" -C "$@" >/dev/null 2>&1 && return 0
+  iptables -t "$table" -A "$@"
+}
+
 del_tunnel_if_exists() {
   local name="$1"
   ip link show "$name" >/dev/null 2>&1 && ip tunnel del "$name" >/dev/null 2>&1 || true
 }
-iptables_rule_once() {
-  # usage: iptables_rule_once -t nat -A PREROUTING ...
-  iptables -C "$@" >/dev/null 2>&1 && return 0
-  iptables "$@"
-}
 
 # ---------- Globals ----------
-IRAN_LOCAL_IP=""
-KHAREJ_PUBLIC_IP=""     # reachable from Iran for outer GRE + SSH
-KHAREJ_PRIVATE_IP=""    # EC2 private (needed for remote "local" param)
-KHAREJ_GRE_LOCAL_IP=""  # what we pass as "local" on Kharej side (AWS=>private, else=>public)
-
+IRAN_IP=""
+KHAREJ_PUBLIC_IP=""
+KHAREJ_PRIVATE_IP=""
+KHAREJ_GRE_LOCAL_IP=""     # remote GRE "local" parameter
 SSH_PORT="22"
 SSH_USER="root"
 SSH_PASS=""
-SUDO_PASS=""
-SUDO_SAME_AS_SSH="true"
-
+SUDO_PASS=""               # only if needed
 DEBUG="false"
 IS_AWS="false"
+ENABLE_TRAFFIC="false"     # enable forwarding/NAT
+
+LOCAL_WAN_IF=""
+REMOTE_WAN_IF=""
 
 # ---------- Input ----------
 prompt_inputs() {
@@ -288,29 +310,44 @@ prompt_inputs() {
   echo "Auto-detected Iran IPv4 (local src): ${detected:-N/A}"
   read -r -p "Use this Iran IPv4? (true/false) [true]: " use_auto
   use_auto="${use_auto:-true}"
+  is_bool "$use_auto" || die "Only 'true' or 'false' allowed."
 
   if [[ "$use_auto" == "true" ]]; then
-    [[ -n "$detected" ]] || die "Auto-detection failed. Rerun and set false to enter Iran IP manually."
-    IRAN_LOCAL_IP="$detected"
-  elif [[ "$use_auto" == "false" ]]; then
+    [[ -n "$detected" ]] || die "Auto-detection failed. Set false to enter Iran IP manually."
+    IRAN_IP="$detected"
+  else
     while true; do
-      read -r -p "Enter Iran IPv4 (local): " IRAN_LOCAL_IP
-      is_valid_ipv4 "$IRAN_LOCAL_IP" && break
+      read -r -p "Enter Iran PUBLIC IPv4: " IRAN_IP
+      is_valid_ipv4 "$IRAN_IP" && break
       echo -e "${RED}Invalid IP format.${NC}"
     done
-  else
-    die "Only 'true' or 'false' allowed."
   fi
 
   read -r -p "Is Kharej server on AWS EC2 (Public IP + Private IP)? (true/false) [false]: " IS_AWS
   IS_AWS="${IS_AWS:-false}"
-  [[ "$IS_AWS" == "true" || "$IS_AWS" == "false" ]] || die "Only 'true' or 'false' allowed."
+  is_bool "$IS_AWS" || die "Only 'true' or 'false' allowed."
 
   while true; do
-    read -r -p "Enter Kharej PUBLIC IPv4 (reachable for SSH / outer GRE): " KHAREJ_PUBLIC_IP
+    read -r -p "Enter Kharej PUBLIC IPv4 (reachable for SSH): " KHAREJ_PUBLIC_IP
     is_valid_ipv4 "$KHAREJ_PUBLIC_IP" && break
     echo -e "${RED}Invalid IP format.${NC}"
   done
+
+  if [[ "$IS_AWS" == "true" ]]; then
+    echo
+    echo "AWS needs BOTH IPs (from EC2 console):"
+    echo "  - Public IPv4  : $KHAREJ_PUBLIC_IP"
+    echo "  - Private IPv4 : (example: 172.26.14.230)"
+    while true; do
+      read -r -p "Enter Kharej PRIVATE IPv4 (EC2 console): " KHAREJ_PRIVATE_IP
+      is_valid_ipv4 "$KHAREJ_PRIVATE_IP" && break
+      echo -e "${RED}Invalid IP format.${NC}"
+    done
+    KHAREJ_GRE_LOCAL_IP="$KHAREJ_PRIVATE_IP"
+  else
+    KHAREJ_PRIVATE_IP=""
+    KHAREJ_GRE_LOCAL_IP="$KHAREJ_PUBLIC_IP"
+  fi
 
   read -r -p "SSH port [22]: " SSH_PORT
   SSH_PORT="${SSH_PORT:-22}"
@@ -321,15 +358,26 @@ prompt_inputs() {
   read -r -s -p "SSH password (leave empty if using SSH key): " SSH_PASS
   echo
 
+  read -r -p "Enable traffic forwarding/NAT after link is up? (true/false) [false]: " ENABLE_TRAFFIC
+  ENABLE_TRAFFIC="${ENABLE_TRAFFIC:-false}"
+  is_bool "$ENABLE_TRAFFIC" || die "Only 'true' or 'false' allowed."
+
   read -r -p "Debug logs on failure? (true/false) [false]: " DEBUG
   DEBUG="${DEBUG:-false}"
+  is_bool "$DEBUG" || die "Only 'true' or 'false' allowed."
+
+  LOCAL_WAN_IF="$(detect_default_iface || true)"
 
   echo
   echo "Summary:"
-  echo "  Iran local IPv4    : $IRAN_LOCAL_IP"
-  echo "  Kharej public IPv4 : $KHAREJ_PUBLIC_IP"
-  echo "  Kharej on AWS      : $IS_AWS"
-  echo "  SSH                : $SSH_USER@$KHAREJ_PUBLIC_IP:$SSH_PORT"
+  echo "  Iran public IPv4      : $IRAN_IP"
+  echo "  Kharej public IPv4    : $KHAREJ_PUBLIC_IP"
+  echo "  Kharej private IPv4   : ${KHAREJ_PRIVATE_IP:-N/A}"
+  echo "  Kharej GRE local IP   : $KHAREJ_GRE_LOCAL_IP"
+  echo "  SSH                   : $SSH_USER@$KHAREJ_PUBLIC_IP:$SSH_PORT"
+  echo "  AWS mode              : $IS_AWS"
+  echo "  Enable traffic/NAT    : $ENABLE_TRAFFIC"
+  echo "  Local WAN iface       : ${LOCAL_WAN_IF:-unknown}"
   echo
 }
 
@@ -357,152 +405,79 @@ preflight_ssh() {
 
   if [[ "$SSH_USER" == "root" ]]; then
     SUDO_PASS=""
-    ok "Remote user is root (no sudo password needed)"
+    ok "Remote user is root (no sudo needed)"
     return 0
   fi
 
-  # Ask sudo password only once, optionally reuse SSH password
-  read -r -p "Use SSH password also as sudo password? (true/false) [true]: " SUDO_SAME_AS_SSH
-  SUDO_SAME_AS_SSH="${SUDO_SAME_AS_SSH:-true}"
-  [[ "$SUDO_SAME_AS_SSH" == "true" || "$SUDO_SAME_AS_SSH" == "false" ]] || die "Only 'true' or 'false' allowed."
-
-  if [[ "$SUDO_SAME_AS_SSH" == "true" ]]; then
-    [[ -n "${SSH_PASS:-}" ]] || die "SSH password is empty (key auth). Can't reuse it for sudo. Choose false and enter sudo password."
+  # IMPORTANT: Do not ask twice.
+  # If SSH password is provided, reuse it for sudo (common setup).
+  if [[ -n "${SSH_PASS:-}" ]]; then
     SUDO_PASS="$SSH_PASS"
-    ok "Remote: sudo password set from SSH password"
-  else
-    read -r -s -p "Sudo password (one-time): " SUDO_PASS
-    echo
-    [[ -n "${SUDO_PASS:-}" ]] || die "Sudo password is required for non-root user."
-  fi
-}
-
-# ---------- AWS private IP detection ----------
-detect_remote_private_ip_if_needed() {
-  if [[ "$IS_AWS" != "true" ]]; then
-    KHAREJ_PRIVATE_IP=""
-    KHAREJ_GRE_LOCAL_IP="$KHAREJ_PUBLIC_IP"
-    ok "Kharej local IP for GRE set to PUBLIC IP: $KHAREJ_GRE_LOCAL_IP"
+    ok "Remote: sudo password will reuse SSH password (single prompt)"
     return 0
   fi
 
-  spinner_start "Detecting AWS Private IPv4 on remote (IMDS / ip route)"
-  local payload out_file out ip
+  # If using SSH key, ask sudo password once.
+  read -r -s -p "Sudo password (one-time): " SUDO_PASS
+  echo
+  [[ -n "${SUDO_PASS:-}" ]] || die "Sudo password is required for non-root user."
+}
 
-  payload=$(
-    cat <<'EOF'
+# ---------- Remote side ----------
+remote_setup_gre_payload() {
+  cat <<'EOF'
 set -euo pipefail
 
-# Try IMDSv2 first
-get_imds_token() {
-  command -v curl >/dev/null 2>&1 || return 1
-  curl -sS -m 2 -X PUT "http://169.254.169.254/latest/api/token" \
-    -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || return 1
-}
-
-get_imds_local_ipv4() {
-  command -v curl >/dev/null 2>&1 || return 1
-  local token=""
-  token="$(get_imds_token 2>/dev/null || true)"
-  if [[ -n "$token" ]]; then
-    curl -sS -m 2 -H "X-aws-ec2-metadata-token: $token" \
-      "http://169.254.169.254/latest/meta-data/local-ipv4" || return 1
-  fi
-  return 1
-}
-
-ip_from_imds="$(get_imds_local_ipv4 2>/dev/null || true)"
-if [[ -n "${ip_from_imds:-}" ]]; then
-  echo "$ip_from_imds"
-  exit 0
-fi
-
-# Fallback: ip route get
-ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}'
-EOF
-  )
-
-  if ! out_file="$(run_remote_payload_b64_capture "$KHAREJ_PUBLIC_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$payload")"; then
-    spinner_stop_fail "Detecting AWS Private IPv4 on remote (IMDS / ip route)"
-    if [[ "$DEBUG" == "true" && -f "$out_file" ]]; then cat "$out_file" >&2; fi
-    rm -f "$out_file" >/dev/null 2>&1 || true
-    warn "Auto-detect failed."
-    out_file=""
-  fi
-
-  if [[ -n "${out_file:-}" && -f "$out_file" ]]; then
-    out="$(tr -d '\r' <"$out_file" | tail -n 20)"
-    rm -f "$out_file" >/dev/null 2>&1 || true
-    ip="$(echo "$out" | tail -n1 | tr -d '[:space:]')"
-  else
-    ip=""
-  fi
-
-  if ! is_valid_ipv4 "${ip:-}"; then
-    spinner_stop_fail "Detecting AWS Private IPv4 on remote (IMDS / ip route)"
-    warn "Could not reliably detect AWS Private IPv4 automatically."
-
-    while true; do
-      read -r -p "Enter Kharej PRIVATE IPv4 (from AWS console, e.g. 172.x.x.x): " KHAREJ_PRIVATE_IP
-      is_valid_ipv4 "$KHAREJ_PRIVATE_IP" && break
-      echo -e "${RED}Invalid IP format.${NC}"
-    done
-  else
-    KHAREJ_PRIVATE_IP="$ip"
-    spinner_stop_ok "AWS private IPv4 detected: $KHAREJ_PRIVATE_IP"
-  fi
-
-  KHAREJ_GRE_LOCAL_IP="$KHAREJ_PRIVATE_IP"
-  ok "Kharej local IP for GRE set to PRIVATE IP: $KHAREJ_GRE_LOCAL_IP"
-}
-
-# ---------- GRE config ----------
-remote_prepare_kernel() {
-  local payload out_file
-  payload=$(
-    cat <<'EOF'
-set -euo pipefail
-
-# Load GRE module if possible (ignore if built-in)
 modprobe ip_gre 2>/dev/null || true
 
-# rp_filter off (prevents asymmetric drop)
+# rp_filter kills asymmetric/encapped flows a lot (AWS especially)
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+# try common nic names
 sysctl -w net.ipv4.conf.ens5.rp_filter=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.eth0.rp_filter=0 >/dev/null 2>&1 || true
 
-true
-EOF
-  )
-  out_file="$(run_remote_payload_b64_capture "$KHAREJ_PUBLIC_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$payload")" || {
-    if [[ "$DEBUG" == "true" && -f "$out_file" ]]; then cat "$out_file" >&2; fi
-    rm -f "$out_file" >/dev/null 2>&1 || true
-    die "Remote kernel prep failed."
-  }
-  rm -f "$out_file" >/dev/null 2>&1 || true
-}
-
-configure_remote_gre() {
-  spinner_start "Configuring GRE on Kharej (remote)"
-  local payload out_file
-
-  payload=$(
-    cat <<'EOF'
-set -euo pipefail
-
 ip link show To_IR >/dev/null 2>&1 && ip tunnel del To_IR >/dev/null 2>&1 || true
 
-ip tunnel add To_IR mode gre remote <IRAN_LOCAL_IP> local <KHAREJ_GRE_LOCAL_IP> ttl 255
+ip tunnel add To_IR mode gre remote <IRAN_IP> local <KHAREJ_GRE_LOCAL_IP> ttl 255
 ip addr add 172.20.20.2/30 dev To_IR
 ip link set To_IR mtu 1436
 ip link set To_IR up
 
+echo "REMOTE_OK"
 ip -d link show To_IR
 ip -4 addr show dev To_IR
 EOF
-  )
-  payload="${payload//<IRAN_LOCAL_IP>/$IRAN_LOCAL_IP}"
+}
+
+remote_enable_traffic_payload() {
+  cat <<'EOF'
+set -euo pipefail
+
+# Enable forwarding
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+# Detect WAN interface (default route)
+WAN_IF="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+[ -n "$WAN_IF" ] || WAN_IF="$(ip -o link show | awk -F': ' 'NR==1{print $2}')"
+
+# Allow forwarding between GRE and WAN
+iptables -C FORWARD -i To_IR -o "$WAN_IF" -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i To_IR -o "$WAN_IF" -j ACCEPT
+iptables -C FORWARD -i "$WAN_IF" -o To_IR -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i "$WAN_IF" -o To_IR -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# NAT (masquerade) only for traffic leaving WAN that came from tunnel subnet
+iptables -t nat -C POSTROUTING -s 172.20.20.0/30 -o "$WAN_IF" -j MASQUERADE >/dev/null 2>&1 || iptables -t nat -A POSTROUTING -s 172.20.20.0/30 -o "$WAN_IF" -j MASQUERADE
+
+echo "REMOTE_TRAFFIC_OK WAN_IF=$WAN_IF"
+EOF
+}
+
+configure_remote() {
+  spinner_start "Configuring GRE on Kharej (remote)"
+  local payload out_file out
+
+  payload="$(remote_setup_gre_payload)"
+  payload="${payload//<IRAN_IP>/$IRAN_IP}"
   payload="${payload//<KHAREJ_GRE_LOCAL_IP>/$KHAREJ_GRE_LOCAL_IP}"
 
   if ! out_file="$(run_remote_payload_b64_capture "$KHAREJ_PUBLIC_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$payload")"; then
@@ -515,28 +490,73 @@ EOF
     die "Remote GRE configuration failed."
   fi
 
+  out="$(cat "$out_file" 2>/dev/null || true)"
+  rm -f "$out_file" >/dev/null 2>&1 || true
   spinner_stop_ok "Remote GRE configured"
-  if [[ "$DEBUG" == "true" && -f "$out_file" ]]; then
+
+  if [[ "$DEBUG" == "true" ]]; then
     echo -e "${CYAN}Remote output (debug):${NC}"
+    echo "$out"
+  fi
+}
+
+enable_remote_traffic() {
+  spinner_start "Enabling forwarding/NAT on Kharej (remote)"
+  local payload out_file
+
+  payload="$(remote_enable_traffic_payload)"
+
+  if ! out_file="$(run_remote_payload_b64_capture "$KHAREJ_PUBLIC_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$payload")"; then
+    spinner_stop_fail "Enabling forwarding/NAT on Kharej (remote)"
+    if [[ "$DEBUG" == "true" && -f "$out_file" ]]; then
+      echo -e "${RED}Remote output (debug):${NC}" >&2
+      cat "$out_file" >&2
+    fi
+    rm -f "$out_file" >/dev/null 2>&1 || true
+    die "Remote traffic/NAT configuration failed."
+  fi
+
+  REMOTE_WAN_IF="$(tr -d '\r' <"$out_file" | grep -oE 'WAN_IF=[^ ]+' | cut -d= -f2 | tail -n1 || true)"
+  if [[ "$DEBUG" == "true" ]]; then
+    echo -e "${CYAN}Remote traffic output (debug):${NC}"
     cat "$out_file" || true
   fi
   rm -f "$out_file" >/dev/null 2>&1 || true
+  spinner_stop_ok "Remote forwarding/NAT enabled"
 }
 
-configure_local_gre() {
+# ---------- Local side ----------
+configure_local() {
   spinner_start "Configuring GRE on Iran (local)"
   modprobe ip_gre 2>/dev/null || true
 
-  # rp_filter off locally too
+  # safer defaults
   sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
   sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
 
   del_tunnel_if_exists "To_Kharej"
-  ip tunnel add To_Kharej mode gre remote "$KHAREJ_PUBLIC_IP" local "$IRAN_LOCAL_IP" ttl 255
+  ip tunnel add To_Kharej mode gre remote "$KHAREJ_PUBLIC_IP" local "$IRAN_IP" ttl 255
   ip addr add 172.20.20.1/30 dev To_Kharej
   ip link set To_Kharej mtu 1436
   ip link set To_Kharej up
   spinner_stop_ok "Local GRE configured"
+}
+
+enable_local_traffic() {
+  spinner_start "Enabling forwarding/NAT on Iran (local)"
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+  LOCAL_WAN_IF="${LOCAL_WAN_IF:-$(detect_default_iface || true)}"
+  [[ -n "${LOCAL_WAN_IF:-}" ]] || warn "Could not detect local WAN iface. NAT rules may need manual adjustment."
+
+  # Allow forwarding between LAN/WAN and GRE (generic accept + established)
+  iptables -C FORWARD -o To_Kharej -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -o To_Kharej -j ACCEPT
+  iptables -C FORWARD -i To_Kharej -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i To_Kharej -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+  # NAT only outbound via GRE (this is the usual "send traffic to Kharej")
+  iptables -t nat -C POSTROUTING -o To_Kharej -j MASQUERADE >/dev/null 2>&1 || iptables -t nat -A POSTROUTING -o To_Kharej -j MASQUERADE
+
+  spinner_stop_ok "Local forwarding/NAT enabled"
 }
 
 test_link() {
@@ -549,64 +569,31 @@ test_link() {
     ok "GRE link is UP (172.20.20.1 <-> 172.20.20.2)."
   else
     spinner_stop_fail "Tunnel ping FAILED"
-    warn "GRE is configured, but ICMP didn't pass."
+    warn "GRE interface is configured, but ICMP did not pass."
+
     echo
-    echo "If this is AWS and you see GRE packets arriving but no replies:"
-    echo "  1) Ensure Kharej GRE local IP is PRIVATE IPv4 (this script uses: $KHAREJ_GRE_LOCAL_IP)"
-    echo "  2) Ensure SG/NACL allow Protocol 47 (GRE)"
-    echo "  3) rp_filter is disabled by script; verify:"
-    echo "       sysctl net.ipv4.conf.all.rp_filter"
-    echo "  4) Run tcpdump:"
-    echo "       Local : tcpdump -ni <public-if> proto 47"
-    echo "       Remote: tcpdump -ni <nic> proto 47"
-    echo "       Remote: tcpdump -ni To_IR icmp"
+    echo "Most common AWS blockers:"
+    echo "  1) Security Group / NACL must allow GRE (Protocol 47) inbound & outbound."
+    echo "  2) EC2 'local' in ip tunnel must be PRIVATE IPv4 (you provided: $KHAREJ_PRIVATE_IP)."
+    echo "  3) rp_filter must be 0 (script sets it)."
+    echo
+    echo "Quick checks:"
+    echo "  Local:  ip -d link show To_Kharej"
+    echo "  Local:  tcpdump -ni ${LOCAL_WAN_IF:-<wan>} proto 47"
+    echo "  Remote: tcpdump -ni ${REMOTE_WAN_IF:-<nic>} proto 47"
+    echo "  Remote: tcpdump -ni To_IR icmp"
   fi
 }
 
-# ---------- Traffic mode (NAT/DNAT) ----------
-enable_forwarding_and_nat_local() {
-  spinner_start "Enabling IPv4 forwarding + NAT rules (local)"
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
-
-  # Your rules (idempotent)
-  iptables_rule_once -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination 172.20.20.1
-  iptables_rule_once -t nat -A PREROUTING -j DNAT --to-destination 172.20.20.2
-  iptables_rule_once -t nat -A POSTROUTING -j MASQUERADE
-
-  spinner_stop_ok "Local forwarding/NAT configured"
-}
-
-enable_forwarding_remote_if_needed() {
-  # optional: for some scenarios you want forwarding on remote too
-  spinner_start "Enabling IPv4 forwarding on remote (Kharej)"
-  local payload out_file
-  payload=$(
-    cat <<'EOF'
-set -euo pipefail
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
-true
-EOF
-  )
-  if ! out_file="$(run_remote_payload_b64_capture "$KHAREJ_PUBLIC_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$payload")"; then
-    spinner_stop_fail "Enabling IPv4 forwarding on remote (Kharej)"
-    if [[ "$DEBUG" == "true" && -f "$out_file" ]]; then cat "$out_file" >&2; fi
-    rm -f "$out_file" >/dev/null 2>&1 || true
-    die "Remote forwarding enable failed."
-  fi
-  rm -f "$out_file" >/dev/null 2>&1 || true
-  spinner_stop_ok "Remote forwarding enabled"
-}
-
-# ---------- Status ----------
 show_status() {
   echo
   echo -e "${CYAN}${BOLD}=== Status (Local) ===${NC}"
-  echo "Version             : ${SCRIPT_VERSION}"
-  echo "Iran local IPv4      : ${IRAN_LOCAL_IP:-N/A}"
-  echo "Kharej public IPv4   : ${KHAREJ_PUBLIC_IP:-N/A}"
-  echo "Kharej private IPv4  : ${KHAREJ_PRIVATE_IP:-N/A}"
-  echo "Kharej GRE local IP  : ${KHAREJ_GRE_LOCAL_IP:-N/A}"
-  echo "AWS mode             : ${IS_AWS:-N/A}"
+  echo "Version: ${SCRIPT_VERSION}"
+  echo "Iran public IPv4    : ${IRAN_IP:-N/A}"
+  echo "Kharej public IPv4  : ${KHAREJ_PUBLIC_IP:-N/A}"
+  echo "Kharej private IPv4 : ${KHAREJ_PRIVATE_IP:-N/A}"
+  echo "Kharej GRE local IP : ${KHAREJ_GRE_LOCAL_IP:-N/A}"
+  echo "AWS mode            : ${IS_AWS:-N/A}"
   echo
 
   echo -e "${BOLD}Local GRE interface:${NC}"
@@ -622,73 +609,107 @@ show_status() {
   ip tunnel show 2>/dev/null || true
   echo
 
-  echo -e "${BOLD}sysctl (local):${NC}"
-  echo "  ip_forward : $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo N/A)"
-  echo "  rp_filter  : all=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo N/A), default=$(sysctl -n net.ipv4.conf.default.rp_filter 2>/dev/null || echo N/A)"
-  echo
-
-  echo -e "${BOLD}iptables nat (local):${NC}"
+  echo -e "${BOLD}iptables (local) nat/filter snapshot:${NC}"
   iptables -t nat -S 2>/dev/null || true
+  iptables -S 2>/dev/null || true
   echo
 }
 
-# ---------- Main actions ----------
-configure_gre_link_only() {
+cleanup_local() {
+  spinner_start "Cleaning local GRE + rules (best-effort)"
+  del_tunnel_if_exists "To_Kharej"
+  # We won't try to delete iptables rules blindly (dangerous).
+  spinner_stop_ok "Local GRE removed (iptables left untouched)"
+}
+
+cleanup_remote() {
+  spinner_start "Cleaning remote GRE (best-effort)"
+  local payload out_file
+  payload=$(
+    cat <<'EOF'
+set -euo pipefail
+ip link show To_IR >/dev/null 2>&1 && ip tunnel del To_IR >/dev/null 2>&1 || true
+echo "REMOTE_CLEAN_OK"
+EOF
+  )
+  if ! out_file="$(run_remote_payload_b64_capture "$KHAREJ_PUBLIC_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$payload")"; then
+    spinner_stop_fail "Cleaning remote GRE (best-effort)"
+    if [[ "$DEBUG" == "true" && -f "$out_file" ]]; then cat "$out_file" >&2; fi
+    rm -f "$out_file" >/dev/null 2>&1 || true
+    die "Remote cleanup failed."
+  fi
+  rm -f "$out_file" >/dev/null 2>&1 || true
+  spinner_stop_ok "Remote GRE removed"
+}
+
+full_setup() {
   info "--- Iran Server (Local) Configuration ---"
   prompt_inputs
   preflight_ssh
-  detect_remote_private_ip_if_needed
 
   echo
   ok "Using Kharej GRE local IP: $KHAREJ_GRE_LOCAL_IP"
   if [[ "$IS_AWS" == "true" ]]; then
     ok "AWS mode: remote GRE local=PRIVATE, remote reachable via PUBLIC"
-    warn "If you want traffic forwarding later: disable Source/Dest Check for the EC2 instance."
   else
     ok "Normal mode: remote GRE local=PUBLIC"
   fi
   echo
 
-  remote_prepare_kernel
-  configure_remote_gre
-  configure_local_gre
+  configure_remote
+  configure_local
   test_link
-}
 
-configure_gre_with_traffic() {
-  configure_gre_link_only
-  echo
-  info "Enabling traffic forwarding mode..."
-  enable_forwarding_and_nat_local
-  enable_forwarding_remote_if_needed
+  if [[ "$ENABLE_TRAFFIC" == "true" ]]; then
+    echo
+    info "Enabling traffic forwarding/NAT (so traffic really passes)..."
+    enable_remote_traffic
+    enable_local_traffic
 
-  echo
-  ok "Traffic mode enabled."
-  if [[ "$IS_AWS" == "true" ]]; then
-    warn "AWS reminder: for forwarding real traffic through EC2, disable Source/Dest Check on the instance."
-    warn "Also ensure SG/NACL allow GRE (proto 47) and your desired forwarded ports."
+    echo
+    ok "Traffic/NAT enabled."
+    if [[ "$IS_AWS" == "true" ]]; then
+      warn "AWS REQUIRED: Disable 'Source/Destination Check' on this EC2 instance (otherwise routing/NAT breaks)."
+      warn "AWS REQUIRED: SecurityGroup/NACL must allow GRE (Protocol 47) IN/OUT."
+    fi
   fi
+
+  echo
+  ok "Done."
 }
 
 main_menu() {
   print_banner
-  echo "1) Configure GRE Link only (IPv4)  [PING TEST]"
-  echo "2) Configure GRE + Traffic Forwarding (NAT/DNAT)"
-  echo "3) Status (Local)"
-  echo "4) Info"
+  echo "1) Full setup (GRE link + optional traffic/NAT)"
+  echo "2) Status (Local)"
+  echo "3) Cleanup (GRE only)"
+  echo "4) Info / AWS checklist"
   echo "0) Exit"
   echo
   read -r -p "Select: " choice
   case "$choice" in
-    1) configure_gre_link_only; pause ;;
-    2) configure_gre_with_traffic; pause ;;
-    3) show_status; pause ;;
+    1) full_setup; pause ;;
+    2) show_status; pause ;;
+    3)
+      info "--- Cleanup ---"
+      # Needs current connection info; re-prompt minimal:
+      prompt_inputs
+      preflight_ssh
+      cleanup_remote
+      cleanup_local
+      pause
+      ;;
     4)
       echo
-      echo "Info:"
-      echo "- AWS: remote GRE 'local' must be PRIVATE IPv4"
-      echo "- AWS traffic: likely needs Source/Dest Check disabled"
-      echo "- rp_filter is disabled by this script on both ends"
+      echo "AWS checklist (must be correct):"
+      echo "  1) You entered EC2 PRIVATE IPv4 correctly (for remote GRE local)."
+      echo "  2) Security Group + NACL allow:"
+      echo "       - Protocol 47 (GRE) inbound + outbound"
+      echo "       - ICMP (for ping test) optional but helpful"
+      echo "       - SSH inbound (port ${SSH_PORT})"
+      echo "  3) If you want traffic routing/NAT through EC2:"
+      echo "       - Disable Source/Destination Check on the instance"
+      echo "       - Keep ip_forward=1 and NAT rules enabled"
       echo
       pause
       ;;
