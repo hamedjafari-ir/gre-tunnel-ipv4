@@ -16,7 +16,6 @@ warn() { echo -e "${YELLOW}WARNING:${NC} $*"; }
 need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo). Example: sudo ./gre-tunnel-wizard.sh"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# ---------- Banner (full, as you had it) ----------
 print_banner() {
   clear
   echo -e "${CYAN}${BOLD}"
@@ -160,8 +159,9 @@ check_tcp_port() {
 }
 
 ssh_run_password() {
-  local host="$1" port="$2" user="$3" pass="$4" remote="$5"
-  timeout 60 sshpass -p "$pass" ssh -p "$port" \
+  local host="$1" port="$2" user="$3" pass="$4"
+  shift 4
+  timeout 90 sshpass -p "$pass" ssh -p "$port" \
     "${SSH_TTY_OPTS[@]}" \
     "${SSH_OPTS_COMMON[@]}" \
     -o BatchMode=no \
@@ -169,19 +169,20 @@ ssh_run_password() {
     -o PubkeyAuthentication=no \
     -o PasswordAuthentication=yes \
     -o NumberOfPasswordPrompts=1 \
-    "$user@$host" "$remote"
+    "$user@$host" "$@"
 }
 
 ssh_run_key() {
-  local host="$1" port="$2" user="$3" remote="$4"
-  timeout 60 ssh -p "$port" \
+  local host="$1" port="$2" user="$3"
+  shift 3
+  timeout 90 ssh -p "$port" \
     "${SSH_TTY_OPTS[@]}" \
     "${SSH_OPTS_COMMON[@]}" \
     -o BatchMode=yes \
     -o PreferredAuthentications=publickey \
     -o PasswordAuthentication=no \
     -o NumberOfPasswordPrompts=0 \
-    "$user@$host" "$remote"
+    "$user@$host" "$@"
 }
 
 ssh_login_check() {
@@ -193,52 +194,64 @@ ssh_login_check() {
   fi
 }
 
-# ---------- Remote exec (fixed heredoc + sudo -i) ----------
+# ---------- Remote exec (robust: send wrapper + payload via stdin) ----------
 run_remote_capture() {
-  local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" cmd="$6"
+  local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" payload="$6"
   local tmp; tmp="$(mktemp)"
 
+  local remote_cmd="SUDO_PASS=$(printf "%q" "${sudo_pass:-}") bash -s"
   local wrapper
   wrapper="$(cat <<'WRAP'
 set -euo pipefail
 
+PAYLOAD="/tmp/gre_payload_$$.sh"
+cleanup() { rm -f "$PAYLOAD" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+# Read payload from stdin marker into a file
+# shellcheck disable=SC2016
+awk 'BEGIN{p=0} $0=="__PAYLOAD_BELOW__"{p=1; next} {if(p) print}' >"$PAYLOAD"
+chmod +x "$PAYLOAD"
+
+run_payload() { bash "$PAYLOAD"; }
+
 if [[ "$(id -u)" -eq 0 ]]; then
-  bash -lc "$CMD_PAYLOAD"
+  run_payload
   exit 0
 fi
 
 if sudo -n true >/dev/null 2>&1; then
-  sudo -i bash -lc "$CMD_PAYLOAD"
+  sudo -i bash "$PAYLOAD"
   exit 0
 fi
 
 if [[ -n "${SUDO_PASS:-}" ]]; then
   printf "%s\n" "$SUDO_PASS" | sudo -S -p "" true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
-  printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash -lc "$CMD_PAYLOAD"
+  printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash "$PAYLOAD"
   exit 0
 fi
 
 echo "SUDO_REQUIRED_NO_PASSWORD" >&2
 exit 52
+
+__PAYLOAD_BELOW__
 WRAP
 )"
 
-  local cmd_payload
-  cmd_payload="$(printf "%q" "$cmd")"
-
-  local remote="SUDO_PASS=$(printf "%q" "${sudo_pass:-}") CMD_PAYLOAD=$cmd_payload bash -s"
-
+  # Send: wrapper + payload (payload must be after marker)
   if [[ -n "${ssh_pass:-}" ]]; then
-    if ! ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote" >"$tmp" 2>&1 <<EOF
+    if ! ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote_cmd" >"$tmp" 2>&1 <<EOF
 $wrapper
+$payload
 EOF
     then
       echo "$tmp"
       return 1
     fi
   else
-    if ! ssh_run_key "$host" "$port" "$user" "$remote" >"$tmp" 2>&1 <<EOF
+    if ! ssh_run_key "$host" "$port" "$user" "$remote_cmd" >"$tmp" 2>&1 <<EOF
 $wrapper
+$payload
 EOF
     then
       echo "$tmp"
@@ -249,7 +262,7 @@ EOF
   echo "$tmp"
 }
 
-# ---------- idempotent helpers ----------
+# ---------- helpers ----------
 del_tunnel_if_exists() {
   local name="$1"
   ip link show "$name" >/dev/null 2>&1 && ip tunnel del "$name" >/dev/null 2>&1 || true
@@ -300,7 +313,7 @@ prompt_inputs() {
 
   # If remote user isn't root:
   # - If SSH password exists: reuse it for sudo (no second prompt)
-  # - Else: ask for sudo password once (unless passwordless sudo exists)
+  # - Else: ask once for sudo password (unless passwordless sudo exists)
   SUDO_PASS=""
   if [[ "${SSH_USER}" != "root" ]]; then
     if [[ -n "${SSH_PASS:-}" ]]; then
@@ -346,8 +359,8 @@ configure_gre_ipv4() {
   prompt_inputs
   preflight_ssh
 
-  local remote_cmd
-  remote_cmd=$(
+  local remote_payload
+  remote_payload=$(
     cat <<'EOF'
 set -euo pipefail
 
@@ -362,19 +375,18 @@ if ! command -v ip >/dev/null 2>&1; then
 fi
 
 ip link show To_IR >/dev/null 2>&1 && ip tunnel del To_IR >/dev/null 2>&1 || true
-
 ip tunnel add To_IR mode gre remote <IP_IRAN> local <IP_KHAREJ> ttl 255
 ip addr add 172.20.20.2/30 dev To_IR
 ip link set To_IR mtu 1436
 ip link set To_IR up
 EOF
   )
-  remote_cmd="${remote_cmd//<IP_IRAN>/$IRAN_IP}"
-  remote_cmd="${remote_cmd//<IP_KHAREJ>/$KHAREJ_IP}"
+  remote_payload="${remote_payload//<IP_IRAN>/$IRAN_IP}"
+  remote_payload="${remote_payload//<IP_KHAREJ>/$KHAREJ_IP}"
 
   spinner_start "Configuring Kharej server (remote GRE setup via sudo -i)"
   local out=""
-  if ! out="$(run_remote_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_cmd")"; then
+  if ! out="$(run_remote_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_payload")"; then
     spinner_stop_fail "Configuring Kharej server (remote GRE setup via sudo -i)"
     if [[ "$DEBUG" == "true" ]]; then
       echo -e "${RED}Remote output (debug):${NC}"
@@ -412,7 +424,6 @@ EOF
   fi
 }
 
-# ---------- Status ----------
 show_status() {
   echo
   echo -e "${CYAN}${BOLD}=== Status (Local) ===${NC}"
