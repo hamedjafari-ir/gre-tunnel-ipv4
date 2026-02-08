@@ -16,10 +16,11 @@ warn() { echo -e "${YELLOW}WARNING:${NC} $*"; }
 need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo). Example: sudo ./gre-tunnel-wizard.sh"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# ---------- Banner (full, as you had it) ----------
 print_banner() {
   clear
   echo -e "${CYAN}${BOLD}"
-cat <<'EOF'
+  cat <<'EOF'
   ██████╗ ██████╗ ███████╗
  ██╔════╝ ██╔══██╗██╔════╝
  ██║  ███╗██████╔╝█████╗
@@ -192,23 +193,17 @@ ssh_login_check() {
   fi
 }
 
-# ---------- Remote exec (no base64, no prompts) ----------
+# ---------- Remote exec (fixed heredoc + sudo -i) ----------
 run_remote_capture() {
   local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" cmd="$6"
   local tmp; tmp="$(mktemp)"
 
-  # Build a remote wrapper that runs CMD via root (sudo -i) if needed.
-  # CMD is injected as a single-quoted heredoc, so it can include anything safely.
   local wrapper
   wrapper="$(cat <<'WRAP'
 set -euo pipefail
 
-run_cmd() {
-  bash -lc "$CMD_PAYLOAD"
-}
-
 if [[ "$(id -u)" -eq 0 ]]; then
-  run_cmd
+  bash -lc "$CMD_PAYLOAD"
   exit 0
 fi
 
@@ -228,23 +223,27 @@ exit 52
 WRAP
 )"
 
-  # Quote payload for bash -lc
   local cmd_payload
   cmd_payload="$(printf "%q" "$cmd")"
 
-  # Remote command: export SUDO_PASS + export CMD_PAYLOAD + run wrapper via stdin
   local remote="SUDO_PASS=$(printf "%q" "${sudo_pass:-}") CMD_PAYLOAD=$cmd_payload bash -s"
 
   if [[ -n "${ssh_pass:-}" ]]; then
-    ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote" >"$tmp" 2>&1 <<EOF
+    if ! ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote" >"$tmp" 2>&1 <<EOF
 $wrapper
 EOF
-    || { echo "$tmp"; return 1; }
+    then
+      echo "$tmp"
+      return 1
+    fi
   else
-    ssh_run_key "$host" "$port" "$user" "$remote" >"$tmp" 2>&1 <<EOF
+    if ! ssh_run_key "$host" "$port" "$user" "$remote" >"$tmp" 2>&1 <<EOF
 $wrapper
 EOF
-    || { echo "$tmp"; return 1; }
+    then
+      echo "$tmp"
+      return 1
+    fi
   fi
 
   echo "$tmp"
@@ -299,9 +298,9 @@ prompt_inputs() {
   read -r -s -p "SSH password (leave empty if using SSH key): " SSH_PASS
   echo
 
-  # If SSH user is not root:
+  # If remote user isn't root:
   # - If SSH password exists: reuse it for sudo (no second prompt)
-  # - Else: ask for sudo password ONCE (required for sudo -i unless passwordless sudo exists)
+  # - Else: ask for sudo password once (unless passwordless sudo exists)
   SUDO_PASS=""
   if [[ "${SSH_USER}" != "root" ]]; then
     if [[ -n "${SSH_PASS:-}" ]]; then
@@ -352,7 +351,6 @@ configure_gre_ipv4() {
     cat <<'EOF'
 set -euo pipefail
 
-# Ensure ip exists
 if ! command -v ip >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y >/dev/null 2>&1 || true
@@ -436,12 +434,6 @@ show_status() {
 show_info() {
   echo -e "${CYAN}GRE Tunnel Wizard (IPv4)${NC}"
   echo "Created by: Hamed Jafari"
-  echo
-  echo "Remote privilege behavior:"
-  echo "  - If SSH user is root: runs directly"
-  echo "  - Else: runs via sudo -i automatically"
-  echo "  - If SSH password is provided: reused for sudo (no second prompt)"
-  echo "  - If SSH key auth is used: asks once for sudo password unless passwordless sudo is enabled"
 }
 
 main_menu() {
