@@ -6,6 +6,8 @@ set -euo pipefail
 # Created by: Hamed Jafari
 # ==========================================================
 
+SCRIPT_VERSION="2026-02-08-IPv4-AWS-SUDO"
+
 GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[1;33m"; CYAN="\033[0;36m"; NC="\033[0m"; BOLD="\033[1m"
 
 die()  { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
@@ -16,6 +18,7 @@ warn() { echo -e "${YELLOW}WARNING:${NC} $*"; }
 need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo). Example: sudo ./gre-tunnel-wizard.sh"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# ---------- Banner ----------
 print_banner() {
   clear
   echo -e "${CYAN}${BOLD}"
@@ -36,6 +39,7 @@ print_banner() {
 EOF
   echo -e "${NC}"
   echo "GRE Tunnel Wizard (IPv4)  |  Created by: Hamed Jafari"
+  echo "Version: $SCRIPT_VERSION"
   echo
 }
 
@@ -106,12 +110,12 @@ ensure_local_deps() {
   command_exists nc       || die "'nc' is missing."
   command_exists timeout  || die "'timeout' is missing."
   command_exists base64   || die "'base64' is missing."
-  if command_exists sshpass; then :; else
-    warn "'sshpass' not found. Password SSH won't work (key auth is fine)."
+  if ! command_exists sshpass; then
+    warn "'sshpass' not found. SSH password auth will not work (SSH key auth is fine)."
   fi
 }
 
-# ---------- SSH ----------
+# ---------- SSH (no host-key prompts) ----------
 KNOWN_HOSTS_TMP="/tmp/gre_tunnel_known_hosts.$$"
 cleanup() { rm -f "$KNOWN_HOSTS_TMP" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -181,18 +185,20 @@ ssh_login_check() {
   fi
 }
 
-# ---------- Remote exec (payload via base64) ----------
-run_remote_payload_b64() {
+# ---------- Remote execution (payload via base64, sudo-aware) ----------
+run_remote_payload_b64_capture() {
   local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" payload="$6"
+
   local tmp; tmp="$(mktemp)"
 
   local payload_b64
   payload_b64="$(printf "%s" "$payload" | base64 -w0)"
 
-  # Remote script: write payload file from base64, then run it as root if needed
+  # Remote: writes /tmp/gre_payload_$$.sh and runs it as root (sudo -i)
   local remote_script
   remote_script="$(cat <<'RS'
 set -euo pipefail
+
 PAYLOAD_B64="$PAYLOAD_B64"
 SUDO_PASS="${SUDO_PASS:-}"
 
@@ -203,17 +209,20 @@ trap cleanup EXIT
 printf "%s" "$PAYLOAD_B64" | base64 -d >"$PAY"
 chmod +x "$PAY"
 
-run_as_root() {
+run_payload_root() {
+  # If already root, run directly
   if [[ "$(id -u)" -eq 0 ]]; then
     bash "$PAY"
     exit 0
   fi
 
+  # Try passwordless sudo
   if sudo -n true >/dev/null 2>&1; then
     sudo -i bash "$PAY"
     exit 0
   fi
 
+  # Try sudo with password
   if [[ -n "$SUDO_PASS" ]]; then
     printf "%s\n" "$SUDO_PASS" | sudo -S -p "" true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
     printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash "$PAY"
@@ -224,12 +233,12 @@ run_as_root() {
   exit 52
 }
 
-run_as_root
+run_payload_root
 RS
 )"
 
-  # We avoid stdin games: pass vars and execute a simple bash -lc
-  local remote_cmd="PAYLOAD_B64=$(printf "%q" "$payload_b64") SUDO_PASS=$(printf "%q" "${sudo_pass:-}") bash -lc $(printf "%q" "$remote_script")"
+  local remote_cmd
+  remote_cmd="PAYLOAD_B64=$(printf "%q" "$payload_b64") SUDO_PASS=$(printf "%q" "${sudo_pass:-}") bash -lc $(printf "%q" "$remote_script")"
 
   if [[ -n "${ssh_pass:-}" ]]; then
     if ! ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote_cmd" >"$tmp" 2>&1; then
@@ -246,17 +255,30 @@ RS
   echo "$tmp"
 }
 
+remote_sudo_n_check() {
+  local host="$1" port="$2" user="$3" ssh_pass="$4"
+  local cmd='sudo -n true >/dev/null 2>&1; echo $?'
+  if [[ -n "${ssh_pass:-}" ]]; then
+    ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$cmd" 2>/dev/null || true
+  else
+    ssh_run_key "$host" "$port" "$user" "$cmd" 2>/dev/null || true
+  fi
+}
+
 # ---------- idempotent helpers ----------
 del_tunnel_if_exists() {
   local name="$1"
   ip link show "$name" >/dev/null 2>&1 && ip tunnel del "$name" >/dev/null 2>&1 || true
 }
+
 add_iptables_rule_once() {
   iptables -C "$@" >/dev/null 2>&1 && return 0
   iptables "$@"
 }
 
 # ---------- Prompts ----------
+IRAN_IP=""; KHAREJ_IP=""; SSH_PORT="22"; SSH_USER="ubuntu"; SSH_PASS=""; SUDO_PASS=""; DEBUG="false"
+
 prompt_inputs() {
   local detected is_auto
   detected="$(detect_ipv4)"
@@ -289,26 +311,22 @@ prompt_inputs() {
   read -r -p "SSH port [22]: " SSH_PORT
   SSH_PORT="${SSH_PORT:-22}"
 
-  read -r -p "SSH user [root]: " SSH_USER
-  SSH_USER="${SSH_USER:-root}"
+  # AWS-friendly default
+  read -r -p "SSH user [ubuntu]: " SSH_USER
+  SSH_USER="${SSH_USER:-ubuntu}"
 
   read -r -s -p "SSH password (leave empty if using SSH key): " SSH_PASS
   echo
 
-  # If remote user isn't root and SSH password is empty (key auth), we need sudo password once.
-  SUDO_PASS=""
-  if [[ "${SSH_USER}" != "root" && -z "${SSH_PASS:-}" ]]; then
-    read -r -s -p "Sudo password on Kharej (required unless passwordless sudo): " SUDO_PASS
-    echo
-  elif [[ "${SSH_USER}" != "root" && -n "${SSH_PASS:-}" ]]; then
-    # reuse ssh password as sudo password
-    SUDO_PASS="$SSH_PASS"
-  fi
-
   read -r -p "Debug logs on failure? (true/false) [false]: " DEBUG
   DEBUG="${DEBUG:-false}"
 
-  export IRAN_IP KHAREJ_IP SSH_PORT SSH_USER SSH_PASS SUDO_PASS DEBUG
+  echo
+  echo "Summary:"
+  echo "  Iran IPv4  : $IRAN_IP"
+  echo "  Kharej IPv4: $KHAREJ_IP"
+  echo "  SSH        : $SSH_USER@$KHAREJ_IP:$SSH_PORT"
+  echo
 }
 
 preflight_ssh() {
@@ -332,22 +350,47 @@ preflight_ssh() {
     die "SSH login failed. Check credentials / SSH key / SSH settings."
   fi
   spinner_stop_ok "SSH login OK"
+
+  # Decide sudo method
+  if [[ "$SSH_USER" != "root" ]]; then
+    spinner_start "Checking sudo mode on Kharej (NOPASSWD?)"
+    local sudo_n
+    sudo_n="$(remote_sudo_n_check "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" | tr -d '\r' | tail -n1 || true)"
+    if [[ "$sudo_n" == "0" ]]; then
+      spinner_stop_ok "Sudo is passwordless (NOPASSWD)"
+      SUDO_PASS=""
+    else
+      spinner_stop_fail "Sudo requires password"
+      # If SSH password exists, reuse it as sudo password
+      if [[ -n "${SSH_PASS:-}" ]]; then
+        SUDO_PASS="$SSH_PASS"
+      else
+        # Key auth + sudo needs password => prompt once
+        read -r -s -p "Sudo password on Kharej (required): " SUDO_PASS
+        echo
+      fi
+    fi
+  else
+    SUDO_PASS=""
+  fi
 }
 
+# ---------- Main action ----------
 configure_gre_ipv4() {
   info "--- Iran Server (Local) Configuration ---"
   prompt_inputs
   preflight_ssh
 
+  # Remote payload (no apt, fast-fail if ip missing)
   local remote_payload
   remote_payload=$(
     cat <<'EOF'
 set -euo pipefail
 
-# hard requirement: ip must exist (no apt install here)
 command -v ip >/dev/null 2>&1 || { echo "Missing dependency: ip (iproute2)" >&2; exit 20; }
 
 ip link show To_IR >/dev/null 2>&1 && ip tunnel del To_IR >/dev/null 2>&1 || true
+
 ip tunnel add To_IR mode gre remote <IP_IRAN> local <IP_KHAREJ> ttl 255
 ip addr add 172.20.20.2/30 dev To_IR
 ip link set To_IR mtu 1436
@@ -358,18 +401,23 @@ EOF
   remote_payload="${remote_payload//<IP_KHAREJ>/$KHAREJ_IP}"
 
   spinner_start "Configuring Kharej server (remote GRE setup via sudo -i)"
-  local out=""
-  if ! out="$(run_remote_payload_b64 "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_payload")"; then
+  local logfile=""
+  if ! logfile="$(run_remote_payload_b64_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_payload")"; then
     spinner_stop_fail "Configuring Kharej server (remote GRE setup via sudo -i)"
-    if [[ "$DEBUG" == "true" ]]; then
-      echo -e "${RED}Remote output (debug):${NC}"
-      cat "$out" >&2
+    echo -e "${RED}Remote output (debug):${NC}" >&2
+    if [[ -n "${logfile:-}" && -f "$logfile" ]]; then
+      cat "$logfile" >&2
+    else
+      echo "(no remote log file captured)" >&2
     fi
-    rm -f "$out" 2>/dev/null || true
     die "Remote GRE configuration failed."
   fi
-  rm -f "$out" 2>/dev/null || true
   spinner_stop_ok "Kharej configured"
+  if [[ "$DEBUG" == "true" && -n "${logfile:-}" && -f "$logfile" ]]; then
+    # Optional: show remote output even on success
+    true
+  fi
+  rm -f "$logfile" >/dev/null 2>&1 || true
 
   spinner_start "Configuring Iran GRE interface"
   del_tunnel_if_exists "To_Kharej"
@@ -381,9 +429,11 @@ EOF
 
   spinner_start "Enabling forwarding and applying NAT rules"
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
   add_iptables_rule_once -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination 172.20.20.1
   add_iptables_rule_once -t nat -A PREROUTING -j DNAT --to-destination 172.20.20.2
   add_iptables_rule_once -t nat -A POSTROUTING -j MASQUERADE
+
   spinner_stop_ok "Forwarding/NAT configured"
 
   spinner_start "Testing tunnel (ping 172.20.20.2)"
@@ -397,27 +447,48 @@ EOF
   fi
 }
 
+# ---------- Status / Settings ----------
 show_status() {
   echo
   echo -e "${CYAN}${BOLD}=== Status (Local) ===${NC}"
   echo
-  if ip link show To_Kharej >/dev/null 2>&1; then
-    echo -e "${BOLD}Interface: To_Kharej${NC}"
-    ip -o link show To_Kharej | sed 's/^[0-9]\+://'
-    echo "IPv4: $(ip -o -4 addr show dev To_Kharej 2>/dev/null | awk '{print $4}' | paste -sd ',' -)"
-  else
-    echo -e "${BOLD}Interface: To_Kharej${NC}"
-    echo "MISSING"
-  fi
+
+  echo -e "${BOLD}Script version:${NC} $SCRIPT_VERSION"
+  echo -e "${BOLD}IPv4 forwarding:${NC} $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo N/A)"
   echo
-  echo -e "${BOLD}ip tunnel show${NC}"
+
+  echo -e "${BOLD}Tunnel interfaces:${NC}"
+  for ifc in To_Kharej To_IR; do
+    if ip link show "$ifc" >/dev/null 2>&1; then
+      echo "  - $ifc: UP"
+      ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print "      IPv4:", $4}'
+      ip -o link show "$ifc" 2>/dev/null | sed 's/^[0-9]\+:\s*//'
+    else
+      echo "  - $ifc: MISSING"
+    fi
+  done
+  echo
+
+  echo -e "${BOLD}ip tunnel show:${NC}"
   ip tunnel show 2>/dev/null || true
+  echo
+
+  echo -e "${BOLD}iptables NAT rules (table nat):${NC}"
+  iptables -t nat -S 2>/dev/null || true
   echo
 }
 
 show_info() {
   echo -e "${CYAN}GRE Tunnel Wizard (IPv4)${NC}"
   echo "Created by: Hamed Jafari"
+  echo "Version: $SCRIPT_VERSION"
+  echo
+  echo "AWS behavior:"
+  echo "  - SSH to root is usually blocked."
+  echo "  - This script uses sudo -i on the remote server."
+  echo "  - If remote sudo is NOPASSWD, no password is needed."
+  echo "  - Otherwise it prompts once and uses sudo -S."
+  echo
 }
 
 main_menu() {
