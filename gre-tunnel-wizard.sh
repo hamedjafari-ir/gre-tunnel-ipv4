@@ -2,11 +2,12 @@
 set -euo pipefail
 
 # ==========================================================
-# GRE Tunnel Wizard (IPv4 only, AWS-friendly)
+# GRE Tunnel Wizard (IPv4 only)
 # Created by: Hamed Jafari
+# Version: 1.2
 # ==========================================================
 
-SCRIPT_VERSION="2026-02-08-IPv4-AWS-BOOTSTRAP"
+SCRIPT_VERSION="1.2"
 
 GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[1;33m"; CYAN="\033[0;36m"; NC="\033[0m"; BOLD="\033[1m"
 
@@ -38,8 +39,7 @@ print_banner() {
      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
 EOF
   echo -e "${NC}"
-  echo "GRE Tunnel Wizard (IPv4)  |  Created by: Hamed Jafari"
-  echo "Version: $SCRIPT_VERSION"
+  echo "GRE Tunnel Wizard (IPv4)  |  Created by: Hamed Jafari  |  Version: ${SCRIPT_VERSION}"
   echo
 }
 
@@ -101,17 +101,18 @@ detect_ipv4() {
   echo "${ip:-}"
 }
 
-# ---------- deps ----------
+# ---------- deps (local only; no apt) ----------
 ensure_local_deps() {
-  command_exists ip       || die "'ip' missing (iproute2)."
-  command_exists iptables || die "'iptables' missing."
-  command_exists ssh      || die "'ssh' missing."
-  command_exists ping     || die "'ping' missing."
-  command_exists nc       || die "'nc' missing."
-  command_exists timeout  || die "'timeout' missing."
-  command_exists base64   || die "'base64' missing."
+  command_exists ip       || die "'ip' is missing (iproute2)."
+  command_exists iptables || die "'iptables' is missing."
+  command_exists sysctl   || die "'sysctl' is missing."
+  command_exists ssh      || die "'ssh' is missing."
+  command_exists ping     || die "'ping' is missing."
+  command_exists nc       || die "'nc' is missing."
+  command_exists timeout  || die "'timeout' is missing."
+  command_exists base64   || die "'base64' is missing."
   if ! command_exists sshpass; then
-    warn "'sshpass' not found. Password SSH auth won't work (key auth is fine)."
+    warn "'sshpass' not found. SSH password auth will not work (SSH key auth is fine)."
   fi
 }
 
@@ -134,7 +135,6 @@ SSH_OPTS_COMMON=(
   -o ChallengeResponseAuthentication=no
   -o PreferredAuthentications=publickey,password
 )
-
 SSH_TTY_OPTS=(-tt)
 
 ssh_trust_hostkey() {
@@ -153,7 +153,7 @@ check_tcp_port() {
 ssh_run_password() {
   local host="$1" port="$2" user="$3" pass="$4" remote="$5"
   command_exists sshpass || die "sshpass not installed but SSH password provided."
-  timeout 90 sshpass -p "$pass" ssh -p "$port" \
+  timeout 120 sshpass -p "$pass" ssh -p "$port" \
     "${SSH_TTY_OPTS[@]}" \
     "${SSH_OPTS_COMMON[@]}" \
     -o BatchMode=no \
@@ -166,7 +166,7 @@ ssh_run_password() {
 
 ssh_run_key() {
   local host="$1" port="$2" user="$3" remote="$4"
-  timeout 90 ssh -p "$port" \
+  timeout 120 ssh -p "$port" \
     "${SSH_TTY_OPTS[@]}" \
     "${SSH_OPTS_COMMON[@]}" \
     -o BatchMode=yes \
@@ -185,23 +185,9 @@ ssh_login_check() {
   fi
 }
 
-remote_cmd_simple() {
-  local host="$1" port="$2" user="$3" ssh_pass="$4" cmd="$5"
-  if [[ -n "${ssh_pass:-}" ]]; then
-    ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$cmd"
-  else
-    ssh_run_key "$host" "$port" "$user" "$cmd"
-  fi
-}
-
-remote_sudo_n_check() {
-  local host="$1" port="$2" user="$3" ssh_pass="$4"
-  remote_cmd_simple "$host" "$port" "$user" "$ssh_pass" 'sudo -n true >/dev/null 2>&1; echo $? 2>/dev/null' 2>/dev/null || true
-}
-
 # ---------- Remote payload runner (base64 + sudo -i) ----------
 run_remote_payload_b64_capture() {
-  local host="$1" port="$2" exec_user="$3" ssh_pass="$4" payload="$5"
+  local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" payload="$6"
   local tmp; tmp="$(mktemp)"
 
   local payload_b64
@@ -210,7 +196,10 @@ run_remote_payload_b64_capture() {
   local remote_script
   remote_script="$(cat <<'RS'
 set -euo pipefail
+
 PAYLOAD_B64="$PAYLOAD_B64"
+SUDO_PASS="${SUDO_PASS:-}"
+
 PAY="/tmp/gre_payload_$$.sh"
 cleanup() { rm -f "$PAY" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -218,33 +207,41 @@ trap cleanup EXIT
 printf "%s" "$PAYLOAD_B64" | base64 -d >"$PAY"
 chmod +x "$PAY"
 
-# Must be root to run ip tunnel commands
-if [[ "$(id -u)" -eq 0 ]]; then
-  bash "$PAY"
-  exit 0
-fi
+run_as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    bash "$PAY"
+    exit 0
+  fi
 
-# We REQUIRE passwordless sudo here (AWS bootstrap user should have it)
-if sudo -n true >/dev/null 2>&1; then
-  sudo -i bash "$PAY"
-  exit 0
-fi
+  if sudo -n true >/dev/null 2>&1; then
+    sudo -i bash "$PAY"
+    exit 0
+  fi
 
-echo "SUDO_PASSWORDLESS_REQUIRED" >&2
-exit 52
+  if [[ -n "$SUDO_PASS" ]]; then
+    printf "%s\n" "$SUDO_PASS" | sudo -S -p "" true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
+    printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash "$PAY"
+    exit 0
+  fi
+
+  echo "SUDO_PASSWORD_REQUIRED" >&2
+  exit 52
+}
+
+run_as_root
 RS
 )"
 
   local remote_cmd
-  remote_cmd="PAYLOAD_B64=$(printf "%q" "$payload_b64") bash -lc $(printf "%q" "$remote_script")"
+  remote_cmd="PAYLOAD_B64=$(printf "%q" "$payload_b64") SUDO_PASS=$(printf "%q" "${sudo_pass:-}") bash -lc $(printf "%q" "$remote_script")"
 
   if [[ -n "${ssh_pass:-}" ]]; then
-    if ! ssh_run_password "$host" "$port" "$exec_user" "$ssh_pass" "$remote_cmd" >"$tmp" 2>&1; then
+    if ! ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote_cmd" >"$tmp" 2>&1; then
       echo "$tmp"
       return 1
     fi
   else
-    if ! ssh_run_key "$host" "$port" "$exec_user" "$remote_cmd" >"$tmp" 2>&1; then
+    if ! ssh_run_key "$host" "$port" "$user" "$remote_cmd" >"$tmp" 2>&1; then
       echo "$tmp"
       return 1
     fi
@@ -253,28 +250,7 @@ RS
   echo "$tmp"
 }
 
-# ---------- AWS bootstrap resolver ----------
-find_bootstrap_user() {
-  local host="$1" port="$2" ssh_pass="$3"
-  local candidates=("ubuntu" "ec2-user" "admin" "debian" "centos")
-
-  for u in "${candidates[@]}"; do
-    # must login
-    if remote_cmd_simple "$host" "$port" "$u" "$ssh_pass" 'echo OK' >/dev/null 2>&1; then
-      # must have passwordless sudo
-      local s
-      s="$(remote_sudo_n_check "$host" "$port" "$u" "$ssh_pass" | tr -d '\r' | tail -n1 || true)"
-      if [[ "$s" == "0" ]]; then
-        echo "$u"
-        return 0
-      fi
-    fi
-  done
-
-  return 1
-}
-
-# ---------- idempotent local helpers ----------
+# ---------- idempotent helpers ----------
 del_tunnel_if_exists() {
   local name="$1"
   ip link show "$name" >/dev/null 2>&1 && ip tunnel del "$name" >/dev/null 2>&1 || true
@@ -285,8 +261,7 @@ add_iptables_rule_once() {
 }
 
 # ---------- Globals ----------
-IRAN_IP=""; KHAREJ_IP=""; SSH_PORT="22"; SSH_USER="ubuntu"; SSH_PASS=""; DEBUG="false"
-REMOTE_EXEC_USER=""
+IRAN_IP=""; KHAREJ_IP=""; SSH_PORT="22"; SSH_USER="ubuntu"; SSH_PASS=""; SUDO_PASS=""; DEBUG="false"
 
 prompt_inputs() {
   local detected is_auto
@@ -320,7 +295,6 @@ prompt_inputs() {
   read -r -p "SSH port [22]: " SSH_PORT
   SSH_PORT="${SSH_PORT:-22}"
 
-  # You can enter hamed here, script will bootstrap if needed
   read -r -p "SSH user [ubuntu]: " SSH_USER
   SSH_USER="${SSH_USER:-ubuntu}"
 
@@ -349,61 +323,35 @@ preflight_ssh() {
   spinner_start "Trusting SSH host key (no fingerprint prompts)"
   if ! ssh_trust_hostkey "$KHAREJ_IP" "$SSH_PORT"; then
     spinner_stop_fail "Trusting SSH host key (no fingerprint prompts)"
-    die "Cannot pre-trust host key. Try once manually: ssh -p $SSH_PORT $SSH_USER@$KHAREJ_IP"
+    die "Cannot pre-trust host key."
   fi
   spinner_stop_ok "Host key trusted"
 
   spinner_start "Checking SSH login (non-interactive)"
   if ! ssh_login_check "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS"; then
     spinner_stop_fail "Checking SSH login (non-interactive)"
-    die "SSH login failed. Check username/key."
+    die "SSH login failed."
   fi
   spinner_stop_ok "SSH login OK"
 
-  # Determine remote exec user (must have passwordless sudo OR be root)
+  # One-time password collection for sudo (store in variable, do not re-ask)
   if [[ "$SSH_USER" == "root" ]]; then
-    REMOTE_EXEC_USER="root"
-    ok "Remote exec user: root"
-    return 0
+    SUDO_PASS=""
+    ok "Remote: root user detected"
+  else
+    if [[ -n "${SSH_PASS:-}" ]]; then
+      SUDO_PASS="$SSH_PASS"
+      ok "Remote: sudo password set from SSH password"
+    else
+      read -r -s -p "Sudo password on Kharej (one-time): " SUDO_PASS
+      echo
+      [[ -n "${SUDO_PASS:-}" ]] || die "Sudo password is required for remote sudo -i."
+      ok "Remote: sudo password captured"
+    fi
   fi
-
-  spinner_start "Checking sudo mode for '$SSH_USER' (NOPASSWD?)"
-  local sudo_n
-  sudo_n="$(remote_sudo_n_check "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" | tr -d '\r' | tail -n1 || true)"
-  if [[ "$sudo_n" == "0" ]]; then
-    spinner_stop_ok "Passwordless sudo available"
-    REMOTE_EXEC_USER="$SSH_USER"
-    ok "Remote exec user: $REMOTE_EXEC_USER"
-    return 0
-  fi
-  spinner_stop_fail "Sudo needs password (AWS often has no password set)"
-
-  spinner_start "Searching AWS bootstrap user with NOPASSWD sudo"
-  local boot=""
-  if boot="$(find_bootstrap_user "$KHAREJ_IP" "$SSH_PORT" "$SSH_PASS")"; then
-    spinner_stop_ok "Bootstrap user found: $boot"
-    REMOTE_EXEC_USER="$boot"
-    ok "Remote exec user: $REMOTE_EXEC_USER"
-    warn "Note: You entered SSH user '$SSH_USER', but remote root tasks will run via '$REMOTE_EXEC_USER' (AWS-style)."
-    return 0
-  fi
-  spinner_stop_fail "No bootstrap user found"
-
-  echo
-  warn "Fix options (on AWS):"
-  echo "  1) SSH with the AMI default user (ubuntu/ec2-user) and keep NOPASSWD sudo."
-  echo "  2) Or create a sudoers rule for your user from a bootstrap user:"
-  echo
-  echo "     sudo tee /etc/sudoers.d/gre-tunnel >/dev/null <<'EOF'"
-  echo "     $SSH_USER ALL=(root) NOPASSWD: /usr/sbin/ip, /usr/sbin/iptables, /usr/sbin/sysctl, /sbin/ip, /sbin/iptables, /sbin/sysctl"
-  echo "     EOF"
-  echo "     sudo chmod 440 /etc/sudoers.d/gre-tunnel"
-  echo "     sudo visudo -c"
-  echo
-
-  die "Remote needs passwordless sudo for automation, but none was found."
 }
 
+# ---------- Main action ----------
 configure_gre_ipv4() {
   info "--- Iran Server (Local) Configuration ---"
   prompt_inputs
@@ -413,6 +361,7 @@ configure_gre_ipv4() {
   remote_payload=$(
     cat <<'EOF'
 set -euo pipefail
+
 command -v ip >/dev/null 2>&1 || { echo "Missing dependency: ip (iproute2)" >&2; exit 20; }
 
 ip link show To_IR >/dev/null 2>&1 && ip tunnel del To_IR >/dev/null 2>&1 || true
@@ -428,7 +377,7 @@ EOF
 
   spinner_start "Configuring Kharej server (remote GRE setup via sudo -i)"
   local log=""
-  if ! log="$(run_remote_payload_b64_capture "$KHAREJ_IP" "$SSH_PORT" "$REMOTE_EXEC_USER" "$SSH_PASS" "$remote_payload")"; then
+  if ! log="$(run_remote_payload_b64_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_payload")"; then
     spinner_stop_fail "Configuring Kharej server (remote GRE setup via sudo -i)"
     echo -e "${RED}Remote output (debug):${NC}" >&2
     if [[ -n "${log:-}" && -f "$log" ]]; then
@@ -440,6 +389,7 @@ EOF
     die "Remote GRE configuration failed."
   fi
   spinner_stop_ok "Kharej configured"
+
   if [[ "$DEBUG" == "true" && -n "${log:-}" && -f "$log" ]]; then
     echo -e "${CYAN}Remote output (debug):${NC}"
     cat "$log" || true
@@ -456,9 +406,11 @@ EOF
 
   spinner_start "Enabling forwarding and applying NAT rules"
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
   add_iptables_rule_once -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination 172.20.20.1
   add_iptables_rule_once -t nat -A PREROUTING -j DNAT --to-destination 172.20.20.2
   add_iptables_rule_once -t nat -A POSTROUTING -j MASQUERADE
+
   spinner_stop_ok "Forwarding/NAT configured"
 
   spinner_start "Testing tunnel (ping 172.20.20.2)"
@@ -467,23 +419,23 @@ EOF
     ok "END: Tunnel created successfully."
   else
     spinner_stop_fail "Ping failed"
-    warn "END (warning): Tunnel is up, but ping failed."
-    echo "Check firewall/provider: GRE protocol 47 must be allowed."
+    warn "END: Tunnel is up, but ping failed."
   fi
 }
 
 show_status() {
   echo
   echo -e "${CYAN}${BOLD}=== Status (Local) ===${NC}"
-  echo "Version: $SCRIPT_VERSION"
+  echo "Version: ${SCRIPT_VERSION}"
   echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo N/A)"
   echo
 
   echo -e "${BOLD}Interfaces:${NC}"
   for ifc in To_Kharej; do
     if ip link show "$ifc" >/dev/null 2>&1; then
-      echo "  - $ifc: UP"
+      echo "  - $ifc: PRESENT"
       ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print "      IPv4:", $4}'
+      ip -o link show "$ifc" 2>/dev/null | sed 's/^[0-9]\+:\s*//'
     else
       echo "  - $ifc: MISSING"
     fi
@@ -494,7 +446,7 @@ show_status() {
   ip tunnel show 2>/dev/null || true
   echo
 
-  echo -e "${BOLD}iptables -t nat -S:${NC}"
+  echo -e "${BOLD}iptables NAT rules:${NC}"
   iptables -t nat -S 2>/dev/null || true
   echo
 }
@@ -502,13 +454,7 @@ show_status() {
 show_info() {
   echo -e "${CYAN}GRE Tunnel Wizard (IPv4)${NC}"
   echo "Created by: Hamed Jafari"
-  echo "Version: $SCRIPT_VERSION"
-  echo
-  echo "AWS note:"
-  echo "  - Many AWS users have NO Linux password set."
-  echo "  - This script therefore requires passwordless sudo on the remote exec user."
-  echo "  - If your chosen user has sudo-password requirement, we auto-detect a bootstrap user (ubuntu/ec2-user/etc)."
-  echo
+  echo "Version: ${SCRIPT_VERSION}"
 }
 
 main_menu() {
