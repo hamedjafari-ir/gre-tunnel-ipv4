@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ==========================================================
-# GRE Tunnel Wizard (IPv4 + IPv6 over SIT + IP6GRE)
+# GRE Tunnel Wizard (IPv4 only)
 # Created by: Hamed Jafari
 # ==========================================================
 
@@ -16,6 +16,7 @@ warn() { echo -e "${YELLOW}WARNING:${NC} $*"; }
 need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo). Example: sudo ./gre-tunnel-wizard.sh"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# ---------- Banner ----------
 print_banner() {
   clear
   echo -e "${CYAN}${BOLD}"
@@ -35,7 +36,7 @@ print_banner() {
      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
 EOF
   echo -e "${NC}"
-  echo "GRE Tunnel Wizard (IPv4 + IPv6)  |  Created by: Hamed Jafari"
+  echo "GRE Tunnel Wizard (IPv4)  |  Created by: Hamed Jafari"
   echo
 }
 
@@ -108,7 +109,7 @@ apt_update_once() {
 
 ensure_local_deps() {
   if command_exists apt-get; then
-    spinner_start "Checking/Installing dependencies (Iran server)"
+    spinner_start "Checking/Installing dependencies (local)"
     apt_update_once
     apt-get install -y iproute2 iptables openssh-client iputils-ping netcat-openbsd sshpass >/dev/null 2>&1 || true
     spinner_stop_ok "Dependencies ready"
@@ -117,7 +118,6 @@ ensure_local_deps() {
     command_exists iptables || die "'iptables' is missing."
     command_exists ssh      || die "'ssh' is missing."
     command_exists ping     || die "'ping' is missing."
-    command_exists ping6    || warn "'ping6' not found (usually provided by iputils-ping). IPv6 test might fail."
     command_exists nc       || die "'nc' is missing."
     command_exists sshpass  || die "'sshpass' is missing."
     command_exists timeout  || die "'timeout' is missing."
@@ -144,6 +144,8 @@ SSH_OPTS_COMMON=(
   -o PreferredAuthentications=publickey,password
 )
 
+SSH_TTY_OPTS=(-tt)
+
 ssh_trust_hostkey() {
   local host="$1" port="$2"
   : >"$KNOWN_HOSTS_TMP"
@@ -156,9 +158,6 @@ check_tcp_port() {
   local host="$1" port="$2"
   nc -zvw3 "$host" "$port" >/dev/null 2>&1
 }
-
-# NOTE: -tt forces a pseudo-tty (helps sudo -i flows on some setups)
-SSH_TTY_OPTS=(-tt)
 
 ssh_run_password() {
   local host="$1" port="$2" user="$3" pass="$4" remote="$5"
@@ -195,16 +194,10 @@ ssh_login_check() {
 }
 
 # ---------- Remote privilege escalation ----------
-# Behavior:
-# - If remote user is root -> run directly
-# - Else:
-#   - Try sudo -n (passwordless)
-#   - Else use SUDO_PASS with sudo -S, and run inside sudo -i (login shell)
 remote_wrapper_template() {
   cat <<'EOS'
 set -euo pipefail
 CMD_B64="<CMD_B64>"
-
 decode_cmd() { printf "%s" "$CMD_B64" | base64 -d; }
 
 if [[ "$(id -u)" -eq 0 ]]; then
@@ -212,15 +205,15 @@ if [[ "$(id -u)" -eq 0 ]]; then
   exit 0
 fi
 
+# passwordless sudo?
 if sudo -n true >/dev/null 2>&1; then
   sudo -i bash -lc "$(decode_cmd)"
   exit 0
 fi
 
+# sudo with password
 if [[ -n "${SUDO_PASS:-}" ]]; then
-  # validate sudo password silently
   printf "%s\n" "$SUDO_PASS" | sudo -S -p "" true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
-  # run as root login shell
   printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash -lc "$(decode_cmd)"
   exit 0
 fi
@@ -238,7 +231,6 @@ run_remote_capture() {
   local wrapper; wrapper="$(remote_wrapper_template)"
   wrapper="${wrapper//<CMD_B64>/$cmd_b64}"
 
-  # Export SUDO_PASS into remote environment (quoted safely)
   local remote="SUDO_PASS=$(printf "%q" "${sudo_pass:-}") bash -lc $(printf "%q" "$wrapper")"
 
   if [[ -n "${ssh_pass:-}" ]]; then
@@ -251,47 +243,20 @@ run_remote_capture() {
 }
 
 # ---------- idempotent helpers ----------
-del_tunnel_if_exists_v4() {
+del_tunnel_if_exists() {
   local name="$1"
   ip link show "$name" >/dev/null 2>&1 && ip tunnel del "$name" >/dev/null 2>&1 || true
-}
-del_tunnel_if_exists_v6() {
-  local name="$1"
-  ip link show "$name" >/dev/null 2>&1 && ip -6 tunnel del "$name" >/dev/null 2>&1 || true
 }
 add_iptables_rule_once() {
   iptables -C "$@" >/dev/null 2>&1 && return 0
   iptables "$@"
 }
 
-iface_state() {
-  local ifc="$1"
-  if ip link show "$ifc" >/dev/null 2>&1; then
-    local st; st="$(ip -o link show "$ifc" | awk '{print $9}' | head -n1 || true)"
-    echo "${st:-UNKNOWN}"
-  else
-    echo "MISSING"
-  fi
-}
-
-show_iface_block() {
-  local ifc="$1" title="$2"
-  echo -e "${BOLD}$title${NC}  (${ifc})"
-  if ip link show "$ifc" >/dev/null 2>&1; then
-    echo "  State : $(iface_state "$ifc")"
-    echo "  IPv4  : $(ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | paste -sd ',' -)"
-    echo "  IPv6  : $(ip -o -6 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | paste -sd ',' -)"
-  else
-    echo "  State : MISSING"
-  fi
-  echo
-}
-
 # ---------- Prompts ----------
-prompt_iran_kharej_ipv4_and_ssh() {
+prompt_inputs() {
   local detected is_auto
   detected="$(detect_ipv4)"
-  [[ -n "$detected" ]] || warn "Could not auto-detect Iran IPv4. You may need to enter it manually."
+  [[ -n "$detected" ]] || warn "Could not auto-detect local IPv4."
 
   echo
   echo "Auto-detected Iran IPv4: ${detected:-N/A}"
@@ -326,14 +291,17 @@ prompt_iran_kharej_ipv4_and_ssh() {
   read -r -s -p "SSH password (leave empty if using SSH key): " SSH_PASS
   echo
 
-  # sudo password policy:
-  # - If SSH password exists => reuse it automatically as sudo password (no second prompt)
-  # - If SSH password is empty => ask once for sudo password (needed for sudo -i)
-  if [[ -n "${SSH_PASS:-}" ]]; then
-    SUDO_PASS="$SSH_PASS"
-  else
-    read -r -s -p "Sudo password on Kharej (required for sudo -i): " SUDO_PASS
-    echo
+  # IMPORTANT:
+  # If SSH password is provided, reuse it for sudo automatically (no second prompt).
+  # If SSH password is empty AND remote user is not root, ask once for sudo password.
+  SUDO_PASS=""
+  if [[ "${SSH_USER}" != "root" ]]; then
+    if [[ -n "${SSH_PASS:-}" ]]; then
+      SUDO_PASS="$SSH_PASS"
+    else
+      read -r -s -p "Sudo password on Kharej (leave empty if passwordless sudo): " SUDO_PASS
+      echo
+    fi
   fi
 
   read -r -p "Debug logs on failure? (true/false) [false]: " DEBUG
@@ -365,12 +333,10 @@ preflight_ssh() {
   spinner_stop_ok "SSH login OK"
 }
 
-# ==========================================================
-# IPv4 GRE
-# ==========================================================
+# ---------- Main action ----------
 configure_gre_ipv4() {
   info "--- Iran Server (Local) Configuration ---"
-  prompt_iran_kharej_ipv4_and_ssh
+  prompt_inputs
   preflight_ssh
 
   local remote_cmd
@@ -414,7 +380,7 @@ EOF
   spinner_stop_ok "Kharej configured"
 
   spinner_start "Configuring Iran GRE interface"
-  del_tunnel_if_exists_v4 "To_Kharej"
+  del_tunnel_if_exists "To_Kharej"
   ip tunnel add To_Kharej mode gre remote "$KHAREJ_IP" local "$IRAN_IP" ttl 255
   ip addr add 172.20.20.1/30 dev To_Kharej
   ip link set To_Kharej mtu 1436
@@ -439,170 +405,47 @@ EOF
   fi
 }
 
-# ==========================================================
-# IPv6: SIT + GRE over IPv6 (ip6gre)
-# ==========================================================
-V6_IRAN="fde8:b030:25cf::de01"
-V6_KHAREJ="fde8:b030:25cf::de02"
-
-configure_ipv6_sit_and_ip6gre() {
-  info "--- IPv6 (SIT + GRE-over-IPv6) Configuration ---"
-  prompt_iran_kharej_ipv4_and_ssh
-  preflight_ssh
-
-  local remote_sit
-  remote_sit=$(
-    cat <<'EOF'
-set -euo pipefail
-
-if ! command -v ip >/dev/null 2>&1; then
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y iproute2 >/dev/null 2>&1
-  else
-    echo "Missing dependency: ip (iproute2)" >&2
-    exit 20
-  fi
-fi
-
-ip link show 6to4_To_IR >/dev/null 2>&1 && ip tunnel del 6to4_To_IR >/dev/null 2>&1 || true
-
-ip tunnel add 6to4_To_IR mode sit remote <IPv4_IRAN> local <IPv4_KHAREJ>
-ip -6 addr add <V6_KHAREJ>/64 dev 6to4_To_IR
-ip link set 6to4_To_IR mtu 1480
-ip link set 6to4_To_IR up
-EOF
-  )
-  remote_sit="${remote_sit//<IPv4_IRAN>/$IRAN_IP}"
-  remote_sit="${remote_sit//<IPv4_KHAREJ>/$KHAREJ_IP}"
-  remote_sit="${remote_sit//<V6_KHAREJ>/$V6_KHAREJ}"
-
-  spinner_start "Configuring Kharej SIT (via sudo -i)"
-  local out=""
-  if ! out="$(run_remote_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_sit")"; then
-    spinner_stop_fail "Configuring Kharej SIT (via sudo -i)"
-    if [[ "$DEBUG" == "true" ]]; then
-      echo -e "${RED}Remote output (debug):${NC}"
-      cat "$out" >&2
-    fi
-    rm -f "$out" 2>/dev/null || true
-    die "Remote SIT configuration failed."
-  fi
-  rm -f "$out" 2>/dev/null || true
-  spinner_stop_ok "Kharej SIT configured"
-
-  spinner_start "Configuring Iran SIT"
-  del_tunnel_if_exists_v4 "6to4_To_KH"
-  ip tunnel add 6to4_To_KH mode sit remote "$KHAREJ_IP" local "$IRAN_IP"
-  ip -6 addr add "$V6_IRAN/64" dev 6to4_To_KH
-  ip link set 6to4_To_KH mtu 1480
-  ip link set 6to4_To_KH up
-  spinner_stop_ok "Iran SIT configured"
-
-  spinner_start "Testing SIT IPv6 link (ping6 $V6_KHAREJ)"
-  if ping6 -c 3 -W 2 "$V6_KHAREJ" >/dev/null 2>&1; then
-    spinner_stop_ok "SIT IPv6 OK"
-  else
-    spinner_stop_fail "SIT IPv6 ping failed"
-    warn "SIT is up, but ping6 failed. Check firewall/provider: protocol 41 must be allowed."
-    warn "Continuing anyway."
-  fi
-
-  local remote_ip6gre
-  remote_ip6gre=$(
-    cat <<'EOF'
-set -euo pipefail
-
-ip link show GRE6Tun_To_IR >/dev/null 2>&1 && ip -6 tunnel del GRE6Tun_To_IR >/dev/null 2>&1 || true
-
-ip -6 tunnel add GRE6Tun_To_IR mode ip6gre remote <V6_IRAN> local <V6_KHAREJ>
-ip addr add 172.20.20.2/30 dev GRE6Tun_To_IR
-ip link set GRE6Tun_To_IR mtu 1436
-ip link set GRE6Tun_To_IR up
-EOF
-  )
-  remote_ip6gre="${remote_ip6gre//<V6_IRAN>/$V6_IRAN}"
-  remote_ip6gre="${remote_ip6gre//<V6_KHAREJ>/$V6_KHAREJ}"
-
-  spinner_start "Configuring Kharej GRE over IPv6 (via sudo -i)"
-  if ! out="$(run_remote_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_ip6gre")"; then
-    spinner_stop_fail "Configuring Kharej GRE over IPv6 (via sudo -i)"
-    if [[ "$DEBUG" == "true" ]]; then
-      echo -e "${RED}Remote output (debug):${NC}"
-      cat "$out" >&2
-    fi
-    rm -f "$out" 2>/dev/null || true
-    die "Remote ip6gre configuration failed."
-  fi
-  rm -f "$out" 2>/dev/null || true
-  spinner_stop_ok "Kharej GRE6 configured"
-
-  spinner_start "Configuring Iran GRE over IPv6"
-  del_tunnel_if_exists_v6 "GRE6Tun_To_KH"
-  ip -6 tunnel add GRE6Tun_To_KH mode ip6gre remote "$V6_KHAREJ" local "$V6_IRAN"
-  ip addr add 172.20.20.1/30 dev GRE6Tun_To_KH
-  ip link set GRE6Tun_To_KH mtu 1436
-  ip link set GRE6Tun_To_KH up
-  spinner_stop_ok "Iran GRE6 configured"
-
-  spinner_start "Testing GRE6 (ping 172.20.20.2)"
-  if ping -c 3 -W 2 172.20.20.2 >/dev/null 2>&1; then
-    spinner_stop_ok "GRE6 OK"
-    ok "END: IPv6 SIT + GRE-over-IPv6 created successfully."
-  else
-    spinner_stop_fail "Ping failed"
-    warn "END (warning): GRE6 interfaces are up, but ping failed."
-  fi
-}
-
-# ==========================================================
-# Settings / Status
-# ==========================================================
+# ---------- Status ----------
 show_settings_status() {
   echo
-  echo -e "${CYAN}${BOLD}=== Settings / Status (Local Iran Server) ===${NC}"
+  echo -e "${CYAN}${BOLD}=== Status (Local) ===${NC}"
   echo
-
-  show_iface_block "To_Kharej" "IPv4 GRE Tunnel (Iran side)"
-  show_iface_block "6to4_To_KH" "IPv6-in-IPv4 SIT Tunnel (Iran side)"
-  echo -e "${BOLD}Expected IPv6 endpoints${NC}"
-  echo "  Iran   : $V6_IRAN/64"
-  echo "  Kharej : $V6_KHAREJ/64"
+  echo -e "${BOLD}Interface: To_Kharej${NC}"
+  if ip link show To_Kharej >/dev/null 2>&1; then
+    ip -o link show To_Kharej | sed 's/^[0-9]\+://'
+    echo "IPv4: $(ip -o -4 addr show dev To_Kharej 2>/dev/null | awk '{print $4}' | paste -sd ',' -)"
+  else
+    echo "MISSING"
+  fi
   echo
-  show_iface_block "GRE6Tun_To_KH" "GRE over IPv6 (Iran side, carries IPv4 172.20.20.0/30)"
-
-  echo -e "${BOLD}Quick checks${NC}"
-  echo "  IPv4 GRE test : ping -c 3 172.20.20.2"
-  echo "  SIT test      : ping6 -c 3 $V6_KHAREJ"
-  echo "  GRE6 test     : ping -c 3 172.20.20.2"
+  echo -e "${BOLD}ip tunnel show${NC}"
+  ip tunnel show 2>/dev/null || true
   echo
 }
 
 show_info() {
-  echo -e "${CYAN}GRE Tunnel Wizard${NC}"
+  echo -e "${CYAN}GRE Tunnel Wizard (IPv4)${NC}"
   echo "Created by: Hamed Jafari"
   echo
   echo "Remote privilege behavior:"
   echo "  - If SSH user is root: runs directly"
-  echo "  - Else: runs via 'sudo -i' automatically"
-  echo "  - If SSH password is provided: reuses it for sudo (no second prompt)"
-  echo "  - If SSH key auth is used: asks once for sudo password"
+  echo "  - Else: runs via sudo -i automatically"
+  echo "  - If SSH password is provided: reused for sudo (no second prompt)"
+  echo "  - If SSH key auth is used: asks once for sudo password unless passwordless sudo is enabled"
 }
 
 main_menu() {
   print_banner
   echo "1) Configure GRE (IPv4)"
-  echo "2) Configure IPv6 (SIT + GRE-over-IPv6)"
-  echo "3) Settings / Status"
-  echo "4) Info"
+  echo "2) Status"
+  echo "3) Info"
   echo "0) Exit"
   echo
   read -r -p "Select: " choice
   case "$choice" in
     1) configure_gre_ipv4; pause ;;
-    2) configure_ipv6_sit_and_ip6gre; pause ;;
-    3) show_settings_status; pause ;;
-    4) show_info; pause ;;
+    2) show_settings_status; pause ;;
+    3) show_info; pause ;;
     0) exit 0 ;;
     *) echo -e "${RED}Invalid option.${NC}"; pause ;;
   esac
