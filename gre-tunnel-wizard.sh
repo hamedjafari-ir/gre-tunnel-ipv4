@@ -2,11 +2,12 @@
 set -euo pipefail
 
 # ==========================================================
-# GRE Tunnel (GRE over IPv4) - Wizard
+# GRE Tunnel Wizard (IPv4)
 # Created by: Hamed Jafari
 # ==========================================================
 
-GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[1;33m"; CYAN="\033[0;36m"; NC="\033[0m"
+GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[1;33m"; CYAN="\033[0;36m"; NC="\033[0m"; BOLD="\033[1m"
+
 die()  { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
 info() { echo -e "${CYAN}$*${NC}"; }
 ok()   { echo -e "${GREEN}$*${NC}"; }
@@ -15,20 +16,27 @@ warn() { echo -e "${YELLOW}WARNING:${NC} $*"; }
 need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo). Example: sudo ./gre-tunnel-wizard.sh"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# ---------- Banner ----------
+# ---------- Banner (safe ASCII, no weird fonts) ----------
 print_banner() {
   clear
-  echo -e "${CYAN}"
+  echo -e "${CYAN}${BOLD}"
   cat <<'EOF'
-   ________  ____  ______      ______                       __
-  / ____/ / / / / / / __ \    /_  __/_  ______  ____  ___  / /
- / / __/ /_/ / /_/ / /_/ /____ / / / / / / __ \/ __ \/ _ \/ /
-/ /_/ / __  / __  / ____/____// / / /_/ / / / / / / /  __/ /
-\____/_/ /_/_/ /_/_/         /_/  \__,_/_/ /_/_/ /_/\___/_/
+  ██████╗ ██████╗ ███████╗
+ ██╔════╝ ██╔══██╗██╔════╝
+ ██║  ███╗██████╔╝█████╗
+ ██║   ██║██╔══██╗██╔══╝
+ ╚██████╔╝██║  ██║███████╗
+  ╚═════╝ ╚═╝  ╚═╝╚══════╝
 
+  ████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗
+  ╚══██╔══╝██║   ██║████╗  ██║████╗  ██║██╔════╝██║
+     ██║   ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██║
+     ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
+     ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
+     ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
 EOF
   echo -e "${NC}"
-  echo "GRE Tunnel (IPv4)  |  Created by: Hamed Jafari"
+  echo "GRE Tunnel Wizard (IPv4)  |  Created by: Hamed Jafari"
   echo
 }
 
@@ -40,7 +48,7 @@ spinner_start() {
     local frames='-\|/'
     local i=0
     while true; do
-      printf "\r%-62s %s" "$msg" "${frames:i%4:1}"
+      printf "\r%-64s %s" "$msg" "${frames:i%4:1}"
       i=$((i+1))
       sleep 0.12
     done
@@ -50,17 +58,21 @@ spinner_start() {
 }
 spinner_stop_ok() {
   local msg="$1"
-  [[ -n "${SPINNER_PID:-}" ]] && kill "$SPINNER_PID" >/dev/null 2>&1 || true
-  [[ -n "${SPINNER_PID:-}" ]] && wait "$SPINNER_PID" >/dev/null 2>&1 || true
-  SPINNER_PID=""
-  printf "\r%-62s ✓\n" "$msg"
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$SPINNER_PID" >/dev/null 2>&1 || true
+    SPINNER_PID=""
+  fi
+  printf "\r%-64s ✓\n" "$msg"
 }
 spinner_stop_fail() {
   local msg="$1"
-  [[ -n "${SPINNER_PID:-}" ]] && kill "$SPINNER_PID" >/dev/null 2>&1 || true
-  [[ -n "${SPINNER_PID:-}" ]] && wait "$SPINNER_PID" >/dev/null 2>&1 || true
-  SPINNER_PID=""
-  printf "\r%-62s ✗\n" "$msg"
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$SPINNER_PID" >/dev/null 2>&1 || true
+    SPINNER_PID=""
+  fi
+  printf "\r%-64s ✗\n" "$msg"
 }
 
 pause() { read -r -p "Press Enter to continue... " _; }
@@ -78,9 +90,11 @@ is_valid_ipv4() {
 }
 
 detect_ipv4() {
-  local ip
+  local ip=""
   ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' || true)"
-  [[ -z "${ip:-}" ]] && ip="$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1 || true)"
+  if [[ -z "${ip:-}" ]]; then
+    ip="$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1 || true)"
+  fi
   echo "${ip:-}"
 }
 
@@ -95,135 +109,109 @@ apt_update_once() {
 
 ensure_local_deps() {
   if command_exists apt-get; then
-    spinner_start "Checking/Installing dependencies on Iran server"
+    spinner_start "Checking/Installing dependencies (Iran server)"
     apt_update_once
     apt-get install -y iproute2 iptables openssh-client iputils-ping netcat-openbsd sshpass >/dev/null 2>&1 || true
     spinner_stop_ok "Dependencies ready"
   else
-    command_exists ip || die "'ip' is missing."
+    command_exists ip       || die "'ip' is missing."
     command_exists iptables || die "'iptables' is missing."
-    command_exists ssh || die "'ssh' is missing."
-    command_exists ping || die "'ping' is missing."
-    command_exists nc || die "'nc' is missing."
-    command_exists sshpass || die "'sshpass' is missing."
+    command_exists ssh      || die "'ssh' is missing."
+    command_exists ping     || die "'ping' is missing."
+    command_exists nc       || die "'nc' is missing."
+    command_exists sshpass  || die "'sshpass' is missing."
   fi
 }
 
 # ---------- SSH (no prompts) ----------
-KNOWN_HOSTS_TMP="/tmp/gre_tunnel_known_hosts"
-touch "$KNOWN_HOSTS_TMP" 2>/dev/null || true
-chmod 600 "$KNOWN_HOSTS_TMP" 2>/dev/null || true
+KNOWN_HOSTS_TMP="/tmp/gre_tunnel_known_hosts.$$"
+cleanup() { rm -f "$KNOWN_HOSTS_TMP" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
 
+# Common opts (keep them conservative; don’t accidentally block auth)
 SSH_OPTS_COMMON=(
-  -o StrictHostKeyChecking=no
   -o UserKnownHostsFile="$KNOWN_HOSTS_TMP"
   -o GlobalKnownHostsFile=/dev/null
+  -o StrictHostKeyChecking=yes
   -o LogLevel=ERROR
   -o ConnectionAttempts=1
   -o ConnectTimeout=8
   -o ServerAliveInterval=2
-  -o ServerAliveCountMax=1
+  -o ServerAliveCountMax=2
   -o GSSAPIAuthentication=no
   -o KbdInteractiveAuthentication=no
   -o ChallengeResponseAuthentication=no
+  -o PreferredAuthentications=publickey,password
 )
 
-# ---------- Checks ----------
-check_tcp_port() {
+# ---- Pre-trust host key (NO "Are you sure" prompt) ----
+ssh_trust_hostkey() {
   local host="$1" port="$2"
-  # fast tcp test (3s)
-  nc -zvw3 "$host" "$port" >/dev/null 2>&1
-}
+  # create file
+  : >"$KNOWN_HOSTS_TMP"
 
-ssh_handshake_check() {
-  # This only tests SSH server response (no auth). Useful to catch weird timeouts early.
-  local host="$1" port="$2"
-  timeout 8 ssh -p "$port" \
-    "${SSH_OPTS_COMMON[@]}" \
-    -o BatchMode=yes \
-    -o PreferredAuthentications=none \
-    -o PubkeyAuthentication=no \
-    -o PasswordAuthentication=no \
-    -o NumberOfPasswordPrompts=0 \
-    "test@$host" "exit" >/dev/null 2>&1
-  # It will usually fail (because no auth), but it must NOT hang/time out.
+  # ssh-keyscan can hang on some networks; force timeout
+  timeout 8 ssh-keyscan -p "$port" -T 5 "$host" >>"$KNOWN_HOSTS_TMP" 2>/dev/null || return 1
+
+  # basic sanity: file must contain something
+  grep -qE "ssh-(rsa|ed25519|ecdsa)" "$KNOWN_HOSTS_TMP" || return 1
   return 0
 }
 
-ssh_run_password_capture() {
+check_tcp_port() {
+  local host="$1" port="$2"
+  nc -zvw3 "$host" "$port" >/dev/null 2>&1
+}
+
+ssh_run_password() {
   local host="$1" port="$2" user="$3" pass="$4" remote="$5"
-  local tmp; tmp="$(mktemp)"
-  # IMPORTANT: BatchMode=no here (more reliable with sshpass)
-  timeout 15 sshpass -p "$pass" ssh -p "$port" \
+  # IMPORTANT: BatchMode MUST be "no" for password auth (otherwise sshpass can't work)
+  timeout 25 sshpass -p "$pass" ssh -p "$port" \
     "${SSH_OPTS_COMMON[@]}" \
     -o BatchMode=no \
     -o PreferredAuthentications=password \
     -o PubkeyAuthentication=no \
     -o PasswordAuthentication=yes \
     -o NumberOfPasswordPrompts=1 \
-    "$user@$host" "$remote" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
-  echo "$tmp"
+    "$user@$host" "$remote"
 }
 
-ssh_run_key_capture() {
+ssh_run_key() {
   local host="$1" port="$2" user="$3" remote="$4"
-  local tmp; tmp="$(mktemp)"
-  timeout 15 ssh -p "$port" \
+  timeout 25 ssh -p "$port" \
     "${SSH_OPTS_COMMON[@]}" \
     -o BatchMode=yes \
     -o PreferredAuthentications=publickey \
     -o PasswordAuthentication=no \
     -o NumberOfPasswordPrompts=0 \
-    "$user@$host" "$remote" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
-  echo "$tmp"
+    "$user@$host" "$remote"
 }
 
 ssh_login_check() {
   local host="$1" port="$2" user="$3" pass="$4"
-  local out=""
   if [[ -n "${pass:-}" ]]; then
-    out="$(ssh_run_password_capture "$host" "$port" "$user" "$pass" "echo OK")" || return 1
-    rm -f "$out" >/dev/null 2>&1 || true
-    return 0
+    ssh_run_password "$host" "$port" "$user" "$pass" "echo OK" >/dev/null 2>&1
   else
-    out="$(ssh_run_key_capture "$host" "$port" "$user" "echo OK")" || return 1
-    rm -f "$out" >/dev/null 2>&1 || true
-    return 0
+    ssh_run_key "$host" "$port" "$user" "echo OK" >/dev/null 2>&1
   fi
 }
 
 run_remote_capture() {
   local host="$1" port="$2" user="$3" pass="$4" cmd="$5"
-  local out=""
+  local tmp; tmp="$(mktemp)"
   if [[ -n "${pass:-}" ]]; then
-    out="$(ssh_run_password_capture "$host" "$port" "$user" "$pass" "bash -lc '$cmd'")" || { echo "$out"; return 1; }
-    echo "$out"
+    ssh_run_password "$host" "$port" "$user" "$pass" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
   else
-    out="$(ssh_run_key_capture "$host" "$port" "$user" "bash -lc '$cmd'")" || { echo "$out"; return 1; }
-    echo "$out"
+    ssh_run_key "$host" "$port" "$user" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
   fi
+  echo "$tmp"
 }
 
-explain_ssh_failure() {
-  local logfile="$1"
-  echo
-  echo -e "${YELLOW}SSH failed. Last output:${NC}"
-  tail -n 25 "$logfile" 2>/dev/null || true
-  echo
-  echo -e "${YELLOW}What to check on Kharej server:${NC}"
-  echo "  - Is the username correct? (root vs ubuntu/debian/etc.)"
-  echo "  - If using root: PermitRootLogin yes"
-  echo "  - If using password: PasswordAuthentication yes"
-  echo "  - If using key: your public key must be in ~/.ssh/authorized_keys"
-  echo "  - If provider blocks root/password: use a normal user and sudo (needs NOPASSWD for automation)"
-}
-
-# ---------- idempotent ----------
+# ---------- idempotent helpers ----------
 del_tunnel_if_exists() {
   local name="$1"
   ip link show "$name" >/dev/null 2>&1 && ip tunnel del "$name" >/dev/null 2>&1 || true
 }
-
 add_iptables_rule_once() {
   iptables -C "$@" >/dev/null 2>&1 && return 0
   iptables "$@"
@@ -287,53 +275,51 @@ configure_gre_ipv4() {
   fi
   spinner_stop_ok "TCP port reachable"
 
-  spinner_start "Checking SSH handshake (no auth)"
-  if ! ssh_handshake_check "$KHAREJ_IP" "$SSH_PORT"; then
-    spinner_stop_fail "Checking SSH handshake (no auth)"
-    die "SSH handshake failed (network/proxy/firewall issue)."
+  spinner_start "Trusting SSH host key (no fingerprint prompts)"
+  if ! ssh_trust_hostkey "$KHAREJ_IP" "$SSH_PORT"; then
+    spinner_stop_fail "Trusting SSH host key (no fingerprint prompts)"
+    echo
+    warn "ssh-keyscan failed. This usually means:"
+    echo "  - Provider blocks keyscan, or"
+    echo "  - Network drops packets after handshake, or"
+    echo "  - SSH is behind some protection / rate limit."
+    echo
+    die "Cannot pre-trust host key. Try manually: ssh -p $SSH_PORT $SSH_USER@$KHAREJ_IP (once), then rerun."
   fi
-  spinner_stop_ok "SSH handshake OK"
+  spinner_stop_ok "Host key trusted"
 
   if [[ -z "${SSH_PASS:-}" ]]; then
     warn "Password is empty => using SSH KEY auth."
-    warn "If you don't have a key installed for this user, login will fail."
+    warn "Make sure Iran server has a working key for: $SSH_USER@$KHAREJ_IP"
   fi
 
   spinner_start "Checking SSH login (non-interactive)"
   if ! ssh_login_check "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS"; then
     spinner_stop_fail "Checking SSH login (non-interactive)"
-    # run one more time to capture logs for user
-    local logf=""
-    if [[ -n "${SSH_PASS:-}" ]]; then
-      logf="$(ssh_run_password_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "echo OK")" || true
-    else
-      logf="$(ssh_run_key_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "echo OK")" || true
-    fi
-    [[ -n "${logf:-}" && -f "$logf" ]] && explain_ssh_failure "$logf"
-    [[ -n "${logf:-}" && -f "$logf" ]] && [[ "$DEBUG" == "true" ]] && { echo -e "${RED}Full debug output:${NC}"; cat "$logf" >&2; }
-    [[ -n "${logf:-}" && -f "$logf" ]] && rm -f "$logf" >/dev/null 2>&1 || true
+    echo
+    echo -e "${YELLOW}What to check on Kharej server:${NC}"
+    echo "  - correct username/password"
+    echo "  - if using root: PermitRootLogin yes"
+    echo "  - if using password: PasswordAuthentication yes"
+    echo "  - if using SSH key: ~/.ssh/authorized_keys must contain Iran server public key"
+    echo
     die "SSH login failed. Check credentials / SSH key / root login settings."
   fi
   spinner_stop_ok "SSH login OK"
 
-  # ---------- Remote preflight + GRE ----------
+  # Remote GRE config
   local remote_cmd
   remote_cmd=$(
     cat <<'EOF'
 set -euo pipefail
 
 if [[ "$(id -u)" -ne 0 ]]; then
-  if command -v sudo >/dev/null 2>&1; then
-    sudo -n true >/dev/null 2>&1 || { echo "Need passwordless sudo (NOPASSWD) for automation." >&2; exit 30; }
-    SUDO="sudo"
-  else
-    echo "Not root and sudo not available." >&2
-    exit 31
-  fi
+  SUDO="sudo"
 else
   SUDO=""
 fi
 
+# Ensure ip exists
 if ! command -v ip >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     $SUDO apt-get update -y >/dev/null 2>&1 || true
@@ -344,8 +330,10 @@ if ! command -v ip >/dev/null 2>&1; then
   fi
 fi
 
+# Clean old
 $SUDO ip link show To_IR >/dev/null 2>&1 && $SUDO ip tunnel del To_IR >/dev/null 2>&1 || true
 
+# Configure GRE on Kharej
 $SUDO ip tunnel add To_IR mode gre remote <IP_IRAN> local <IP_KHAREJ> ttl 255
 $SUDO ip addr add 172.20.20.2/30 dev To_IR
 $SUDO ip link set To_IR mtu 1436
@@ -355,21 +343,20 @@ EOF
   remote_cmd="${remote_cmd//<IP_IRAN>/$IRAN_IP}"
   remote_cmd="${remote_cmd//<IP_KHAREJ>/$KHAREJ_IP}"
 
-  spinner_start "Configuring Kharej server (GRE)"
+  spinner_start "Configuring Kharej server (remote GRE setup)"
   local out=""
   if ! out="$(run_remote_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$remote_cmd")"; then
-    spinner_stop_fail "Configuring Kharej server (GRE)"
-    if [[ -f "${out:-}" ]]; then
-      explain_ssh_failure "$out"
-      [[ "$DEBUG" == "true" ]] && { echo -e "${RED}Full debug output:${NC}"; cat "$out" >&2; }
-      rm -f "$out" >/dev/null 2>&1 || true
+    spinner_stop_fail "Configuring Kharej server (remote GRE setup)"
+    if [[ "$DEBUG" == "true" ]]; then
+      echo -e "${RED}Remote output (debug):${NC}"
+      cat "$out" >&2
     fi
+    rm -f "$out" 2>/dev/null || true
     die "Remote GRE configuration failed."
   fi
-  rm -f "$out" >/dev/null 2>&1 || true
+  rm -f "$out" 2>/dev/null || true
   spinner_stop_ok "Kharej configured"
 
-  # ---------- Local GRE ----------
   spinner_start "Configuring Iran GRE interface"
   del_tunnel_if_exists "To_Kharej"
   ip tunnel add To_Kharej mode gre remote "$KHAREJ_IP" local "$IRAN_IP" ttl 255
@@ -378,15 +365,13 @@ EOF
   ip link set To_Kharej up
   spinner_stop_ok "Iran GRE interface configured"
 
-  # ---------- NAT / Forward ----------
-  spinner_start "Enabling forwarding and NAT rules"
+  spinner_start "Enabling forwarding and applying NAT rules"
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   add_iptables_rule_once -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination 172.20.20.1
   add_iptables_rule_once -t nat -A PREROUTING -j DNAT --to-destination 172.20.20.2
   add_iptables_rule_once -t nat -A POSTROUTING -j MASQUERADE
   spinner_stop_ok "Forwarding/NAT configured"
 
-  # ---------- Test ----------
   spinner_start "Testing tunnel (ping 172.20.20.2)"
   if ping -c 3 -W 2 172.20.20.2 >/dev/null 2>&1; then
     spinner_stop_ok "Tunnel OK"
@@ -399,7 +384,7 @@ EOF
 }
 
 show_info() {
-  echo -e "${CYAN}GRE Tunnel${NC}"
+  echo -e "${CYAN}GRE Tunnel Wizard${NC}"
   echo "Created by: Hamed Jafari"
   echo "Configures GRE tunnel (IPv4) between Iran and Kharej via SSH."
 }
