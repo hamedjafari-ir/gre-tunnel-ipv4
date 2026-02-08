@@ -16,11 +16,11 @@ warn() { echo -e "${YELLOW}WARNING:${NC} $*"; }
 need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo). Example: sudo ./gre-tunnel-wizard.sh"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# ---------- Banner ----------
 print_banner() {
   clear
   echo -e "${CYAN}${BOLD}"
   cat <<'EOF'
+
   ██████╗ ██████╗ ███████╗
  ██╔════╝ ██╔══██╗██╔════╝
  ██║  ███╗██████╔╝█████╗
@@ -34,6 +34,7 @@ print_banner() {
      ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
      ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
+
 EOF
   echo -e "${NC}"
   echo "GRE Tunnel Wizard (IPv4)  |  Created by: Hamed Jafari"
@@ -193,50 +194,59 @@ ssh_login_check() {
   fi
 }
 
-# ---------- Remote privilege escalation ----------
-remote_wrapper_template() {
-  cat <<'EOS'
+# ---------- Remote exec (no base64, no prompts) ----------
+run_remote_capture() {
+  local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" cmd="$6"
+  local tmp; tmp="$(mktemp)"
+
+  # Build a remote wrapper that runs CMD via root (sudo -i) if needed.
+  # CMD is injected as a single-quoted heredoc, so it can include anything safely.
+  local wrapper
+  wrapper="$(cat <<'WRAP'
 set -euo pipefail
-CMD_B64="<CMD_B64>"
-decode_cmd() { printf "%s" "$CMD_B64" | base64 -d; }
+
+run_cmd() {
+  bash -lc "$CMD_PAYLOAD"
+}
 
 if [[ "$(id -u)" -eq 0 ]]; then
-  bash -lc "$(decode_cmd)"
+  run_cmd
   exit 0
 fi
 
-# passwordless sudo?
 if sudo -n true >/dev/null 2>&1; then
-  sudo -i bash -lc "$(decode_cmd)"
+  sudo -i bash -lc "$CMD_PAYLOAD"
   exit 0
 fi
 
-# sudo with password
 if [[ -n "${SUDO_PASS:-}" ]]; then
   printf "%s\n" "$SUDO_PASS" | sudo -S -p "" true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
-  printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash -lc "$(decode_cmd)"
+  printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash -lc "$CMD_PAYLOAD"
   exit 0
 fi
 
 echo "SUDO_REQUIRED_NO_PASSWORD" >&2
 exit 52
-EOS
-}
+WRAP
+)"
 
-run_remote_capture() {
-  local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" cmd="$6"
-  local tmp; tmp="$(mktemp)"
+  # Quote payload for bash -lc
+  local cmd_payload
+  cmd_payload="$(printf "%q" "$cmd")"
 
-  local cmd_b64; cmd_b64="$(printf "%s" "$cmd" | base64 -w0)"
-  local wrapper; wrapper="$(remote_wrapper_template)"
-  wrapper="${wrapper//<CMD_B64>/$cmd_b64}"
-
-  local remote="SUDO_PASS=$(printf "%q" "${sudo_pass:-}") bash -lc $(printf "%q" "$wrapper")"
+  # Remote command: export SUDO_PASS + export CMD_PAYLOAD + run wrapper via stdin
+  local remote="SUDO_PASS=$(printf "%q" "${sudo_pass:-}") CMD_PAYLOAD=$cmd_payload bash -s"
 
   if [[ -n "${ssh_pass:-}" ]]; then
-    ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
+    ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote" >"$tmp" 2>&1 <<EOF
+$wrapper
+EOF
+    || { echo "$tmp"; return 1; }
   else
-    ssh_run_key "$host" "$port" "$user" "$remote" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
+    ssh_run_key "$host" "$port" "$user" "$remote" >"$tmp" 2>&1 <<EOF
+$wrapper
+EOF
+    || { echo "$tmp"; return 1; }
   fi
 
   echo "$tmp"
@@ -291,9 +301,9 @@ prompt_inputs() {
   read -r -s -p "SSH password (leave empty if using SSH key): " SSH_PASS
   echo
 
-  # IMPORTANT:
-  # If SSH password is provided, reuse it for sudo automatically (no second prompt).
-  # If SSH password is empty AND remote user is not root, ask once for sudo password.
+  # If SSH user is not root:
+  # - If SSH password exists: reuse it for sudo (no second prompt)
+  # - Else: ask for sudo password ONCE (required for sudo -i unless passwordless sudo exists)
   SUDO_PASS=""
   if [[ "${SSH_USER}" != "root" ]]; then
     if [[ -n "${SSH_PASS:-}" ]]; then
@@ -344,6 +354,7 @@ configure_gre_ipv4() {
     cat <<'EOF'
 set -euo pipefail
 
+# Ensure ip exists
 if ! command -v ip >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y >/dev/null 2>&1 || true
@@ -406,15 +417,16 @@ EOF
 }
 
 # ---------- Status ----------
-show_settings_status() {
+show_status() {
   echo
   echo -e "${CYAN}${BOLD}=== Status (Local) ===${NC}"
   echo
-  echo -e "${BOLD}Interface: To_Kharej${NC}"
   if ip link show To_Kharej >/dev/null 2>&1; then
+    echo -e "${BOLD}Interface: To_Kharej${NC}"
     ip -o link show To_Kharej | sed 's/^[0-9]\+://'
     echo "IPv4: $(ip -o -4 addr show dev To_Kharej 2>/dev/null | awk '{print $4}' | paste -sd ',' -)"
   else
+    echo -e "${BOLD}Interface: To_Kharej${NC}"
     echo "MISSING"
   fi
   echo
@@ -444,7 +456,7 @@ main_menu() {
   read -r -p "Select: " choice
   case "$choice" in
     1) configure_gre_ipv4; pause ;;
-    2) show_settings_status; pause ;;
+    2) show_status; pause ;;
     3) show_info; pause ;;
     0) exit 0 ;;
     *) echo -e "${RED}Invalid option.${NC}"; pause ;;
