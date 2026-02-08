@@ -24,12 +24,19 @@ need_root() {
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 # ---------- SSH options (NO prompts / auto trust) ----------
-SSH_OPTS=(
+SSH_BASE_OPTS=(
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
   -o GlobalKnownHostsFile=/dev/null
   -o LogLevel=ERROR
-  -o ConnectTimeout=10
+  -o ConnectionAttempts=1
+)
+
+# Fast connect options for the "quick check"
+SSH_FAST_OPTS=(
+  -o ConnectTimeout=5
+  -o ServerAliveInterval=2
+  -o ServerAliveCountMax=1
 )
 
 # ---------- Spinner (always show activity) ----------
@@ -40,7 +47,7 @@ spinner_start() {
     local frames='-\|/'
     local i=0
     while true; do
-      printf "\r%-52s %s" "$msg" "${frames:i%4:1}"
+      printf "\r%-60s %s" "$msg" "${frames:i%4:1}"
       i=$((i+1))
       sleep 0.12
     done
@@ -48,6 +55,7 @@ spinner_start() {
   SPINNER_PID=$!
   disown "$SPINNER_PID" 2>/dev/null || true
 }
+
 spinner_stop_ok() {
   local msg="$1"
   if [[ -n "${SPINNER_PID:-}" ]]; then
@@ -55,8 +63,9 @@ spinner_stop_ok() {
     wait "$SPINNER_PID" >/dev/null 2>&1 || true
     SPINNER_PID=""
   fi
-  printf "\r%-52s ✓\n" "$msg"
+  printf "\r%-60s ✓\n" "$msg"
 }
+
 spinner_stop_fail() {
   local msg="$1"
   if [[ -n "${SPINNER_PID:-}" ]]; then
@@ -64,7 +73,7 @@ spinner_stop_fail() {
     wait "$SPINNER_PID" >/dev/null 2>&1 || true
     SPINNER_PID=""
   fi
-  printf "\r%-52s ✗\n" "$msg"
+  printf "\r%-60s ✗\n" "$msg"
 }
 
 pause() { read -r -p "Press Enter to continue... " _; }
@@ -103,7 +112,6 @@ ensure_local_deps() {
   if command_exists apt-get; then
     spinner_start "Checking/Installing local dependencies (Iran server)"
     apt_update_once
-    # We DO install sshpass here to make the whole flow non-interactive by default
     apt-get install -y iproute2 iptables openssh-client iputils-ping sshpass >/dev/null 2>&1 || true
     spinner_stop_ok "Local dependencies ready"
   else
@@ -115,36 +123,51 @@ ensure_local_deps() {
   fi
 }
 
-# ---------------- SSH runner (no prompts) ----------------
-run_remote_capture() {
-  # Returns path to temp output file on success OR failure (caller deletes it).
-  # Usage:
-  #   out="$(run_remote_capture host port user pass cmd)"  # success
-  #   out="$(run_remote_capture ...)" || { cat "$out"; ... } # failure
-  local host="$1" port="$2" user="$3" pass="$4" cmd="$5"
-  local tmp; tmp="$(mktemp)"
+# ---------------- SSH helpers (Outline-style) ----------------
+ssh_cmd_password() {
+  # password-based ssh (fast, non-interactive) - like your Outline script
+  local host="$1" port="$2" user="$3" pass="$4" remote="$5"
+  sshpass -p "$pass" ssh -p "$port" \
+    "${SSH_BASE_OPTS[@]}" \
+    -o PreferredAuthentications=password \
+    -o PubkeyAuthentication=no \
+    -o PasswordAuthentication=yes \
+    -o NumberOfPasswordPrompts=1 \
+    "$user@$host" "$remote"
+}
 
-  # Always prefer sshpass to avoid interactive password prompts
-  if command_exists sshpass; then
-    sshpass -p "$pass" ssh -p "$port" "${SSH_OPTS[@]}" "$user@$host" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
-  else
-    # Fallback (may prompt for password, but will NEVER prompt for host key)
-    ssh -p "$port" "${SSH_OPTS[@]}" "$user@$host" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
-  fi
-
-  echo "$tmp"
-  return 0
+ssh_cmd_key() {
+  # key-based ssh (no password)
+  local host="$1" port="$2" user="$3" remote="$4"
+  ssh -p "$port" \
+    "${SSH_BASE_OPTS[@]}" \
+    -o PreferredAuthentications=publickey \
+    -o PasswordAuthentication=no \
+    -o NumberOfPasswordPrompts=0 \
+    "$user@$host" "$remote"
 }
 
 quick_ssh_check() {
   local host="$1" port="$2" user="$3" pass="$4"
-  local tmp; tmp="$(mktemp)"
-  if command_exists sshpass; then
-    sshpass -p "$pass" ssh -p "$port" "${SSH_OPTS[@]}" "$user@$host" "echo OK" >"$tmp" 2>&1 || { rm -f "$tmp"; return 1; }
+  if [[ -n "${pass:-}" ]]; then
+    ssh_cmd_password "$host" "$port" "$user" "$pass" "echo OK" >/dev/null 2>&1
   else
-    ssh -p "$port" "${SSH_OPTS[@]}" "$user@$host" "echo OK" >"$tmp" 2>&1 || { rm -f "$tmp"; return 1; }
+    ssh_cmd_key "$host" "$port" "$user" "echo OK" >/dev/null 2>&1
   fi
-  rm -f "$tmp"
+}
+
+run_remote_capture() {
+  local host="$1" port="$2" user="$3" pass="$4" cmd="$5"
+  local tmp; tmp="$(mktemp)"
+
+  # Run through bash -lc on remote (like before)
+  if [[ -n "${pass:-}" ]]; then
+    ssh_cmd_password "$host" "$port" "$user" "$pass" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
+  else
+    ssh_cmd_key "$host" "$port" "$user" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
+  fi
+
+  echo "$tmp"
   return 0
 }
 
@@ -199,7 +222,7 @@ configure_gre_ipv4() {
   read -r -p "SSH user [root]: " SSH_USER
   SSH_USER="${SSH_USER:-root}"
 
-  read -r -s -p "SSH password: " SSH_PASS
+  read -r -s -p "SSH password (leave empty if using SSH key): " SSH_PASS
   echo
 
   read -r -p "Enable debug logs if remote fails? (true/false) [false]: " DEBUG
@@ -212,11 +235,11 @@ configure_gre_ipv4() {
   echo "  SSH        : $SSH_USER@$KHAREJ_IP:$SSH_PORT"
   echo
 
-  # Quick SSH check (fast fail)
-  spinner_start "Testing SSH connectivity to Kharej"
-  if ! quick_ssh_check "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS"; then
-    spinner_stop_fail "Testing SSH connectivity to Kharej"
-    die "SSH connection failed. Check IP/port/user/password or firewall."
+  # Quick SSH check (FAST)
+  spinner_start "Testing SSH connectivity to Kharej (fast check)"
+  if ! ( quick_ssh_check "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" ); then
+    spinner_stop_fail "Testing SSH connectivity to Kharej (fast check)"
+    die "SSH connection failed quickly. Check IP/port/user/password or SSH key, firewall, and root login settings."
   fi
   spinner_stop_ok "SSH connectivity OK"
 
@@ -265,7 +288,7 @@ EOF
       cat "$out" >&2
     fi
     rm -f "$out" 2>/dev/null || true
-    die "Remote configuration failed. Use debug=true to see why."
+    die "Remote configuration failed. Use debug=true to see output."
   fi
   rm -f "$out" 2>/dev/null || true
   spinner_stop_ok "Kharej server configured"
