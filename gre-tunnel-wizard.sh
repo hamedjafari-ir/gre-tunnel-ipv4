@@ -112,7 +112,8 @@ ensure_local_deps() {
   if command_exists apt-get; then
     spinner_start "Checking/Installing local dependencies (Iran server)"
     apt_update_once
-    apt-get install -y iproute2 iptables openssh-client iputils-ping sshpass >/dev/null 2>&1 || true
+    # add "coreutils" so "timeout" is available everywhere
+    apt-get install -y iproute2 iptables openssh-client iputils-ping sshpass coreutils >/dev/null 2>&1 || true
     spinner_stop_ok "Local dependencies ready"
   else
     command_exists ip || die "'ip' is missing."
@@ -120,12 +121,13 @@ ensure_local_deps() {
     command_exists ssh || die "'ssh' is missing."
     command_exists ping || die "'ping' is missing."
     command_exists sshpass || die "'sshpass' is missing (install it manually)."
+    command_exists timeout || die "'timeout' is missing (install coreutils)."
   fi
 }
 
 # ---------------- SSH helpers (Outline-style) ----------------
 ssh_cmd_password() {
-  # password-based ssh (fast, non-interactive) - like your Outline script
+  # password-based ssh (non-interactive)
   local host="$1" port="$2" user="$3" pass="$4" remote="$5"
   sshpass -p "$pass" ssh -p "$port" \
     "${SSH_BASE_OPTS[@]}" \
@@ -147,12 +149,23 @@ ssh_cmd_key() {
     "$user@$host" "$remote"
 }
 
-quick_ssh_check() {
+# Warmup: force first-trust handshake with NO user prompts
+ssh_warmup() {
   local host="$1" port="$2" user="$3" pass="$4"
   if [[ -n "${pass:-}" ]]; then
-    ssh_cmd_password "$host" "$port" "$user" "$pass" "echo OK" >/dev/null 2>&1
+    timeout 8 ssh_cmd_password "$host" "$port" "$user" "$pass" "exit" >/dev/null 2>&1
   else
-    ssh_cmd_key "$host" "$port" "$user" "echo OK" >/dev/null 2>&1
+    timeout 8 ssh_cmd_key "$host" "$port" "$user" "exit" >/dev/null 2>&1
+  fi
+}
+
+quick_ssh_check() {
+  # FAST check with hard timeout, so it never "hangs"
+  local host="$1" port="$2" user="$3" pass="$4"
+  if [[ -n "${pass:-}" ]]; then
+    timeout 8 ssh_cmd_password "$host" "$port" "$user" "$pass" "echo OK" >/dev/null 2>&1
+  else
+    timeout 8 ssh_cmd_key "$host" "$port" "$user" "echo OK" >/dev/null 2>&1
   fi
 }
 
@@ -160,11 +173,11 @@ run_remote_capture() {
   local host="$1" port="$2" user="$3" pass="$4" cmd="$5"
   local tmp; tmp="$(mktemp)"
 
-  # Run through bash -lc on remote (like before)
+  # Run through bash -lc on remote, with hard timeout
   if [[ -n "${pass:-}" ]]; then
-    ssh_cmd_password "$host" "$port" "$user" "$pass" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
+    timeout 25 ssh_cmd_password "$host" "$port" "$user" "$pass" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
   else
-    ssh_cmd_key "$host" "$port" "$user" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
+    timeout 25 ssh_cmd_key "$host" "$port" "$user" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
   fi
 
   echo "$tmp"
@@ -235,11 +248,19 @@ configure_gre_ipv4() {
   echo "  SSH        : $SSH_USER@$KHAREJ_IP:$SSH_PORT"
   echo
 
-  # Quick SSH check (FAST)
+  # 1) Warmup (handles fingerprint trust silently)
+  spinner_start "Initializing SSH trust (no prompts)"
+  if ! ssh_warmup "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS"; then
+    spinner_stop_fail "Initializing SSH trust (no prompts)"
+    die "Cannot initialize SSH trust. Check network/port/credentials."
+  fi
+  spinner_stop_ok "SSH trust established"
+
+  # 2) Quick SSH check (FAST, hard timeout)
   spinner_start "Testing SSH connectivity to Kharej (fast check)"
-  if ! ( quick_ssh_check "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" ); then
+  if ! quick_ssh_check "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS"; then
     spinner_stop_fail "Testing SSH connectivity to Kharej (fast check)"
-    die "SSH connection failed quickly. Check IP/port/user/password or SSH key, firewall, and root login settings."
+    die "SSH connection failed. Check IP/port/user/password or SSH key, firewall, and root login settings."
   fi
   spinner_stop_ok "SSH connectivity OK"
 
