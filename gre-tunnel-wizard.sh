@@ -19,8 +19,7 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 print_banner() {
   clear
   echo -e "${CYAN}${BOLD}"
-  cat <<'EOF'
-
+cat <<'EOF'
   ██████╗ ██████╗ ███████╗
  ██╔════╝ ██╔══██╗██╔════╝
  ██║  ███╗██████╔╝█████╗
@@ -34,7 +33,6 @@ print_banner() {
      ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
      ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
-
 EOF
   echo -e "${NC}"
   echo "GRE Tunnel Wizard (IPv4)  |  Created by: Hamed Jafari"
