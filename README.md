@@ -30,9 +30,6 @@ sudo apt-get update && sudo apt-get install -y sshpass
 
 ## What the script does
 
-- Detects Iran public IPv4 automatically
-- Asks for Kharej server IP
-- Connects to Kharej via SSH
 - Configures GRE tunnel on both servers
 - Enables IP forwarding
 - Applies NAT rules
@@ -68,9 +65,6 @@ sudo apt-get update && sudo apt-get install -y sshpass
 
 ## کارهایی که اسکریپت انجام می‌دهد
 
-- تشخیص خودکار IP ورژن 4 سرور ایران
-- دریافت IP سرور خارج از کاربر
-- اتصال SSH به سرور خارج
 - تنظیم کامل تونل GRE در هر دو سرور
 - فعال‌سازی IP Forward
 - اعمال تنظیمات NAT
