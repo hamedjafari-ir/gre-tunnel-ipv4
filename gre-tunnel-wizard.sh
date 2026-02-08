@@ -23,6 +23,53 @@ need_root() {
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# ---------- SSH options (NO prompts / auto trust) ----------
+SSH_OPTS=(
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null
+  -o GlobalKnownHostsFile=/dev/null
+  -o LogLevel=ERROR
+  -o ConnectTimeout=10
+)
+
+# ---------- Spinner (always show activity) ----------
+SPINNER_PID=""
+spinner_start() {
+  local msg="$1"
+  (
+    local frames='-\|/'
+    local i=0
+    while true; do
+      printf "\r%-52s %s" "$msg" "${frames:i%4:1}"
+      i=$((i+1))
+      sleep 0.12
+    done
+  ) &
+  SPINNER_PID=$!
+  disown "$SPINNER_PID" 2>/dev/null || true
+}
+spinner_stop_ok() {
+  local msg="$1"
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$SPINNER_PID" >/dev/null 2>&1 || true
+    SPINNER_PID=""
+  fi
+  printf "\r%-52s ✓\n" "$msg"
+}
+spinner_stop_fail() {
+  local msg="$1"
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$SPINNER_PID" >/dev/null 2>&1 || true
+    SPINNER_PID=""
+  fi
+  printf "\r%-52s ✗\n" "$msg"
+}
+
+pause() { read -r -p "Press Enter to continue... " _; }
+
+# ---------- IP utils ----------
 is_valid_ipv4() {
   local ip="$1"
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -43,20 +90,6 @@ detect_ipv4() {
   echo "${ip:-}"
 }
 
-progress_8s() {
-  local frames=("-" "\\" "|" "/")
-  local i=0 p=0 step=5 sleep_s=0.4
-  while (( p <= 100 )); do
-    printf "\rConfiguring remote server... %3d%% %s" "$p" "${frames[i]}"
-    i=$(( (i + 1) % 4 ))
-    p=$(( p + step ))
-    sleep "$sleep_s"
-  done
-  printf "\rConfiguring remote server... 100%% ✓\n"
-}
-
-pause() { read -r -p "Press Enter to continue... " _; }
-
 # ---------------- Local deps (Iran server) ----------------
 APT_UPDATED=0
 apt_update_once() {
@@ -67,63 +100,50 @@ apt_update_once() {
 }
 
 ensure_local_deps() {
-  # We do NOT force sshpass anymore. We'll use it if present, otherwise plain ssh.
   if command_exists apt-get; then
-    info "Checking local dependencies..."
+    spinner_start "Checking/Installing local dependencies (Iran server)"
     apt_update_once
-    apt-get install -y iproute2 iptables openssh-client iputils-ping >/dev/null 2>&1 || true
-    ok "Local dependencies ready."
+    # We DO install sshpass here to make the whole flow non-interactive by default
+    apt-get install -y iproute2 iptables openssh-client iputils-ping sshpass >/dev/null 2>&1 || true
+    spinner_stop_ok "Local dependencies ready"
   else
     command_exists ip || die "'ip' is missing."
     command_exists iptables || die "'iptables' is missing."
     command_exists ssh || die "'ssh' is missing."
     command_exists ping || die "'ping' is missing."
+    command_exists sshpass || die "'sshpass' is missing (install it manually)."
   fi
 }
 
-# ---------------- SSH runner (sshpass optional) ----------------
-# If sshpass exists, run fully non-interactive.
-# If not, run plain ssh and user will enter password manually (no install required).
-run_remote() {
-  local host="$1" port="$2" user="$3" pass="$4" cmd="$5" debug="${6:-false}"
-  local tmp
-  tmp="$(mktemp)"
+# ---------------- SSH runner (no prompts) ----------------
+run_remote_capture() {
+  # Returns path to temp output file on success OR failure (caller deletes it).
+  # Usage:
+  #   out="$(run_remote_capture host port user pass cmd)"  # success
+  #   out="$(run_remote_capture ...)" || { cat "$out"; ... } # failure
+  local host="$1" port="$2" user="$3" pass="$4" cmd="$5"
+  local tmp; tmp="$(mktemp)"
 
+  # Always prefer sshpass to avoid interactive password prompts
   if command_exists sshpass; then
-    sshpass -p "$pass" ssh \
-      -p "$port" \
-      -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile=/dev/null \
-      -o LogLevel=ERROR \
-      -o ConnectTimeout=10 \
-      "$user@$host" \
-      "bash -lc '$cmd'" >"$tmp" 2>&1 || {
-        if [[ "$debug" == "true" ]]; then
-          echo -e "${RED}Remote output (debug):${NC}"
-          cat "$tmp" >&2
-        fi
-        rm -f "$tmp"
-        return 1
-      }
+    sshpass -p "$pass" ssh -p "$port" "${SSH_OPTS[@]}" "$user@$host" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
   else
-    warn "sshpass not found. Using normal SSH (you may be prompted for password)."
-    ssh \
-      -p "$port" \
-      -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile=/dev/null \
-      -o LogLevel=ERROR \
-      -o ConnectTimeout=10 \
-      "$user@$host" \
-      "bash -lc '$cmd'" >"$tmp" 2>&1 || {
-        if [[ "$debug" == "true" ]]; then
-          echo -e "${RED}Remote output (debug):${NC}"
-          cat "$tmp" >&2
-        fi
-        rm -f "$tmp"
-        return 1
-      }
+    # Fallback (may prompt for password, but will NEVER prompt for host key)
+    ssh -p "$port" "${SSH_OPTS[@]}" "$user@$host" "bash -lc '$cmd'" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
   fi
 
+  echo "$tmp"
+  return 0
+}
+
+quick_ssh_check() {
+  local host="$1" port="$2" user="$3" pass="$4"
+  local tmp; tmp="$(mktemp)"
+  if command_exists sshpass; then
+    sshpass -p "$pass" ssh -p "$port" "${SSH_OPTS[@]}" "$user@$host" "echo OK" >"$tmp" 2>&1 || { rm -f "$tmp"; return 1; }
+  else
+    ssh -p "$port" "${SSH_OPTS[@]}" "$user@$host" "echo OK" >"$tmp" 2>&1 || { rm -f "$tmp"; return 1; }
+  fi
   rm -f "$tmp"
   return 0
 }
@@ -179,7 +199,7 @@ configure_gre_ipv4() {
   read -r -p "SSH user [root]: " SSH_USER
   SSH_USER="${SSH_USER:-root}"
 
-  read -r -s -p "SSH password (press Enter if using SSH key): " SSH_PASS
+  read -r -s -p "SSH password: " SSH_PASS
   echo
 
   read -r -p "Enable debug logs if remote fails? (true/false) [false]: " DEBUG
@@ -192,10 +212,15 @@ configure_gre_ipv4() {
   echo "  SSH        : $SSH_USER@$KHAREJ_IP:$SSH_PORT"
   echo
 
+  # Quick SSH check (fast fail)
+  spinner_start "Testing SSH connectivity to Kharej"
+  if ! quick_ssh_check "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS"; then
+    spinner_stop_fail "Testing SSH connectivity to Kharej"
+    die "SSH connection failed. Check IP/port/user/password or firewall."
+  fi
+  spinner_stop_ok "SSH connectivity OK"
+
   # ---------- Remote preflight + config ----------
-  # - Ensure ip is available (install iproute2 if apt exists)
-  # - Ensure we run as root or via sudo
-  # - Make it re-runnable (delete existing To_IR first)
   local remote_cmd
   remote_cmd=$(
     cat <<'EOF'
@@ -231,42 +256,44 @@ EOF
   remote_cmd="${remote_cmd//<IP_IRAN>/$IRAN_IP}"
   remote_cmd="${remote_cmd//<IP_KHAREJ>/$KHAREJ_IP}"
 
-  progress_8s
-  if ! run_remote "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$remote_cmd" "$DEBUG"; then
-    die "Remote configuration failed. Try debug=true, or use root / passwordless sudo on Kharej."
+  spinner_start "Configuring Kharej server (remote GRE setup)"
+  out=""
+  if ! out="$(run_remote_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$remote_cmd")"; then
+    spinner_stop_fail "Configuring Kharej server (remote GRE setup)"
+    if [[ "$DEBUG" == "true" ]]; then
+      echo -e "${RED}Remote output (debug):${NC}"
+      cat "$out" >&2
+    fi
+    rm -f "$out" 2>/dev/null || true
+    die "Remote configuration failed. Use debug=true to see why."
   fi
-  ok "Kharej server configured."
-  echo
+  rm -f "$out" 2>/dev/null || true
+  spinner_stop_ok "Kharej server configured"
 
   # ---------- Local (Iran) config ----------
-  info "Configuring Iran server now..."
-
+  spinner_start "Configuring Iran GRE interface"
   del_tunnel_if_exists "To_Kharej"
   ip tunnel add To_Kharej mode gre remote "$KHAREJ_IP" local "$IRAN_IP" ttl 255
   ip addr add 172.20.20.1/30 dev To_Kharej
   ip link set To_Kharej mtu 1436
   ip link set To_Kharej up
-
-  ok "Iran GRE interface configured."
-  echo
+  spinner_stop_ok "Iran GRE interface configured"
 
   # ---------- Forwarding & NAT (Iran) ----------
-  info "Enabling forwarding and applying iptables rules..."
+  spinner_start "Enabling forwarding and applying NAT rules"
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
-
-  # Your exact rules, idempotent:
   add_iptables_rule_once -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination 172.20.20.1
   add_iptables_rule_once -t nat -A PREROUTING -j DNAT --to-destination 172.20.20.2
   add_iptables_rule_once -t nat -A POSTROUTING -j MASQUERADE
-
-  ok "Forwarding rules applied."
-  echo
+  spinner_stop_ok "Forwarding/NAT configured"
 
   # ---------- Test ----------
-  info "Testing tunnel (ping 172.20.20.2 from Iran)..."
+  spinner_start "Testing tunnel connectivity (ping 172.20.20.2)"
   if ping -c 3 -W 2 172.20.20.2 >/dev/null 2>&1; then
+    spinner_stop_ok "Tunnel test successful"
     ok "END: Tunnel created successfully."
   else
+    spinner_stop_fail "Tunnel test failed"
     warn "END (with warning): Tunnel is up, but ping failed."
     echo "Check firewall/provider: GRE protocol 47 must be allowed."
   fi
@@ -299,6 +326,7 @@ main_menu() {
 
 need_root
 ensure_local_deps
+
 while true; do
   main_menu
 done
