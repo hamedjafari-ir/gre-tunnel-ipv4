@@ -2,21 +2,31 @@
 set -euo pipefail
 
 # ==========================================================
-# GRE Tunnel Wizard (IPv4 only)
-# Created by: Hamed Jafari
-# Version: 1.4 (AWS-aware + better debug)
+# GRE Link Wizard (IPv4 only) - Normal Servers + AWS EC2
+# Created by: Hamed Jafari (refined)
+# Version: 1.5
+#
+# What it does:
+# - Creates a GRE point-to-point link (172.20.20.0/30) between:
+#   Iran (local machine running this script)  <-->  Kharej (remote via SSH)
+# - Handles AWS correctly:
+#   * Remote "local" IP for GRE must be the instance PRIVATE IPv4 (not the Public IPv4)
+# - No NAT / no DNAT rules are added (SAFE MODE).
+#
+# Requirements (local):
+# - bash, ip, sysctl, ssh, nc, timeout, base64, ping
+# - sshpass optional (only if using SSH password instead of key)
 # ==========================================================
 
-SCRIPT_VERSION="1.4"
+SCRIPT_VERSION="1.5"
 
 GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[1;33m"; CYAN="\033[0;36m"; NC="\033[0m"; BOLD="\033[1m"
-
 die()  { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
 info() { echo -e "${CYAN}$*${NC}"; }
 ok()   { echo -e "${GREEN}$*${NC}"; }
 warn() { echo -e "${YELLOW}WARNING:${NC} $*"; }
 
-need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo). Example: sudo ./gre-tunnel-wizard.sh"; }
+need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root. Example: sudo ./gre-link-wizard.sh"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 # ---------- Banner ----------
@@ -30,16 +40,9 @@ print_banner() {
  ██║   ██║██╔══██╗██╔══╝
  ╚██████╔╝██║  ██║███████╗
   ╚═════╝ ╚═╝  ╚═╝╚══════╝
-
-  ████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗
-  ╚══██╔══╝██║   ██║████╗  ██║████╗  ██║██╔════╝██║
-     ██║   ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██║
-     ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
-     ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
-     ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
 EOF
   echo -e "${NC}"
-  echo "GRE Tunnel Wizard (IPv4)  |  Created by: Hamed Jafari  |  Version: ${SCRIPT_VERSION}"
+  echo "GRE Link Wizard (IPv4)  |  Created by: Hamed Jafari  |  Version: ${SCRIPT_VERSION}"
   echo
 }
 
@@ -51,7 +54,7 @@ spinner_start() {
     local frames='-\|/'
     local i=0
     while true; do
-      printf "\r%-64s %s" "$msg" "${frames:i%4:1}"
+      printf "\r%-70s %s" "$msg" "${frames:i%4:1}"
       i=$((i+1))
       sleep 0.12
     done
@@ -66,7 +69,7 @@ spinner_stop_ok() {
     wait "$SPINNER_PID" >/dev/null 2>&1 || true
     SPINNER_PID=""
   fi
-  printf "\r%-64s ✓\n" "$msg"
+  printf "\r%-70s ✓\n" "$msg"
 }
 spinner_stop_fail() {
   local msg="$1"
@@ -75,7 +78,7 @@ spinner_stop_fail() {
     wait "$SPINNER_PID" >/dev/null 2>&1 || true
     SPINNER_PID=""
   fi
-  printf "\r%-64s ✗\n" "$msg"
+  printf "\r%-70s ✗\n" "$msg"
 }
 
 pause() { read -r -p "Press Enter to continue... " _; }
@@ -92,7 +95,8 @@ is_valid_ipv4() {
   return 0
 }
 
-detect_ipv4() {
+detect_local_ipv4() {
+  # best-effort: the src IP used to reach internet
   local ip=""
   ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' || true)"
   if [[ -z "${ip:-}" ]]; then
@@ -101,23 +105,23 @@ detect_ipv4() {
   echo "${ip:-}"
 }
 
-# ---------- deps (local only; no apt) ----------
+# ---------- deps ----------
 ensure_local_deps() {
   command_exists ip       || die "'ip' is missing (iproute2)."
-  command_exists iptables || die "'iptables' is missing."
   command_exists sysctl   || die "'sysctl' is missing."
   command_exists ssh      || die "'ssh' is missing."
   command_exists ping     || die "'ping' is missing."
   command_exists nc       || die "'nc' is missing."
   command_exists timeout  || die "'timeout' is missing."
   command_exists base64   || die "'base64' is missing."
+  command_exists modprobe || warn "'modprobe' not found. Kernel module load might fail on some systems."
   if ! command_exists sshpass; then
-    warn "'sshpass' not found. SSH password auth will not work (SSH key auth is fine)."
+    warn "'sshpass' not found. SSH password auth won't work (SSH key auth is fine)."
   fi
 }
 
-# ---------- SSH ----------
-KNOWN_HOSTS_TMP="/tmp/gre_tunnel_known_hosts.$$"
+# ---------- SSH helpers ----------
+KNOWN_HOSTS_TMP="/tmp/gre_link_known_hosts.$$"
 cleanup() { rm -f "$KNOWN_HOSTS_TMP" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
@@ -152,7 +156,7 @@ check_tcp_port() {
 
 ssh_run_password() {
   local host="$1" port="$2" user="$3" pass="$4" remote="$5"
-  command_exists sshpass || die "sshpass not installed but SSH password provided."
+  command_exists sshpass || die "sshpass not installed but SSH password was provided."
   timeout 180 sshpass -p "$pass" ssh -p "$port" \
     "${SSH_TTY_OPTS[@]}" \
     "${SSH_OPTS_COMMON[@]}" \
@@ -185,26 +189,15 @@ ssh_login_check() {
   fi
 }
 
-# Captures stdout+stderr into tmp file and returns its path (even on failure)
-remote_exec_capture() {
-  local host="$1" port="$2" user="$3" ssh_pass="$4" cmd="$5"
-  local tmp; tmp="$(mktemp)"
-  if [[ -n "${ssh_pass:-}" ]]; then
-    ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$cmd" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
-  else
-    ssh_run_key "$host" "$port" "$user" "$cmd" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
-  fi
-  echo "$tmp"
-}
-
-# ---------- Remote payload runner (base64 + root/sudo -i) ----------
+# ---------- Remote payload runner (base64 + sudo -i) ----------
 run_remote_payload_b64_capture() {
   local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" payload="$6"
+  local tmp; tmp="$(mktemp)"
 
-  local payload_b64 remote_script remote_cmd tmp
-  tmp="$(mktemp)"
+  local payload_b64
   payload_b64="$(printf "%s" "$payload" | base64 -w0)"
 
+  local remote_script
   remote_script="$(cat <<'RS'
 set -euo pipefail
 
@@ -224,13 +217,11 @@ run_as_root() {
     exit 0
   fi
 
-  # try passwordless sudo first
   if sudo -n true >/dev/null 2>&1; then
     sudo -i bash "$PAY"
     exit 0
   fi
 
-  # if password provided, use it
   if [[ -n "$SUDO_PASS" ]]; then
     printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -k true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
     printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash "$PAY"
@@ -245,12 +236,19 @@ run_as_root
 RS
 )"
 
+  local remote_cmd
   remote_cmd="PAYLOAD_B64=$(printf "%q" "$payload_b64") SUDO_PASS=$(printf "%q" "${sudo_pass:-}") bash -lc $(printf "%q" "$remote_script")"
 
   if [[ -n "${ssh_pass:-}" ]]; then
-    ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote_cmd" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
+    if ! ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote_cmd" >"$tmp" 2>&1; then
+      echo "$tmp"
+      return 1
+    fi
   else
-    ssh_run_key "$host" "$port" "$user" "$remote_cmd" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
+    if ! ssh_run_key "$host" "$port" "$user" "$remote_cmd" >"$tmp" 2>&1; then
+      echo "$tmp"
+      return 1
+    fi
   fi
 
   echo "$tmp"
@@ -261,65 +259,50 @@ del_tunnel_if_exists() {
   local name="$1"
   ip link show "$name" >/dev/null 2>&1 && ip tunnel del "$name" >/dev/null 2>&1 || true
 }
-add_iptables_rule_once() {
-  iptables -C "$@" >/dev/null 2>&1 && return 0
-  iptables "$@"
-}
 
 # ---------- Globals ----------
-IRAN_IP=""
-KHAREJ_IS_AWS="false"
+IRAN_LOCAL_IP=""
 KHAREJ_PUBLIC_IP=""
-KHAREJ_PRIVATE_IP=""     # only when AWS=true
-KHAREJ_LOCAL_GRE_IP=""   # what we use for "local" on Kharej GRE
+KHAREJ_PRIVATE_IP=""
+KHAREJ_GRE_LOCAL_IP=""   # the "local" parameter on Kharej side (AWS => private, normal => public)
 SSH_PORT="22"
 SSH_USER="root"
 SSH_PASS=""
 SUDO_PASS=""
 DEBUG="false"
+IS_AWS="false"
 
 prompt_inputs() {
-  local detected is_auto
+  local detected use_auto
 
-  detected="$(detect_ipv4)"
-  [[ -n "$detected" ]] || warn "Could not auto-detect local IPv4."
-
+  detected="$(detect_local_ipv4)"
   echo
-  echo "Auto-detected Iran IPv4: ${detected:-N/A}"
-  read -r -p "Use this Iran IPv4? (true/false) [true]: " is_auto
-  is_auto="${is_auto:-true}"
+  echo "Auto-detected Iran IPv4 (local src): ${detected:-N/A}"
+  read -r -p "Use this Iran IPv4? (true/false) [true]: " use_auto
+  use_auto="${use_auto:-true}"
 
-  if [[ "$is_auto" == "true" ]]; then
-    [[ -n "$detected" ]] || die "Auto-detection failed. Rerun and set false to enter Iran IP."
-    IRAN_IP="$detected"
-  elif [[ "$is_auto" == "false" ]]; then
+  if [[ "$use_auto" == "true" ]]; then
+    [[ -n "$detected" ]] || die "Auto-detection failed. Rerun and set false to enter Iran IP manually."
+    IRAN_LOCAL_IP="$detected"
+  elif [[ "$use_auto" == "false" ]]; then
     while true; do
-      read -r -p "Enter Iran IPv4: " IRAN_IP
-      is_valid_ipv4 "$IRAN_IP" && break
+      read -r -p "Enter Iran IPv4 (local): " IRAN_LOCAL_IP
+      is_valid_ipv4 "$IRAN_LOCAL_IP" && break
       echo -e "${RED}Invalid IP format.${NC}"
     done
   else
     die "Only 'true' or 'false' allowed."
   fi
 
-  echo
-  read -r -p "Is Kharej server on AWS (Public IP + Private IP)? (true/false) [false]: " KHAREJ_IS_AWS
-  KHAREJ_IS_AWS="${KHAREJ_IS_AWS:-false}"
-  [[ "$KHAREJ_IS_AWS" == "true" || "$KHAREJ_IS_AWS" == "false" ]] || die "Only true/false allowed."
+  read -r -p "Is Kharej server on AWS EC2 (Public IP + Private IP)? (true/false) [false]: " IS_AWS
+  IS_AWS="${IS_AWS:-false}"
+  [[ "$IS_AWS" == "true" || "$IS_AWS" == "false" ]] || die "Only 'true' or 'false' allowed."
 
   while true; do
-    read -r -p "Enter Kharej PUBLIC IPv4 (reachable IP for SSH): " KHAREJ_PUBLIC_IP
+    read -r -p "Enter Kharej PUBLIC IPv4 (reachable for SSH): " KHAREJ_PUBLIC_IP
     is_valid_ipv4 "$KHAREJ_PUBLIC_IP" && break
     echo -e "${RED}Invalid IP format.${NC}"
   done
-
-  if [[ "$KHAREJ_IS_AWS" == "true" ]]; then
-    while true; do
-      read -r -p "Enter Kharej PRIVATE IPv4 (AWS private, e.g. 172.x.x.x): " KHAREJ_PRIVATE_IP
-      is_valid_ipv4 "$KHAREJ_PRIVATE_IP" && break
-      echo -e "${RED}Invalid IP format.${NC}"
-    done
-  fi
 
   read -r -p "SSH port [22]: " SSH_PORT
   SSH_PORT="${SSH_PORT:-22}"
@@ -335,13 +318,10 @@ prompt_inputs() {
 
   echo
   echo "Summary:"
-  echo "  Iran IPv4           : $IRAN_IP"
-  echo "  Kharej PUBLIC IPv4  : $KHAREJ_PUBLIC_IP"
-  if [[ "$KHAREJ_IS_AWS" == "true" ]]; then
-    echo "  Kharej PRIVATE IPv4 : $KHAREJ_PRIVATE_IP"
-  fi
-  echo "  SSH                 : $SSH_USER@$KHAREJ_PUBLIC_IP:$SSH_PORT"
-  echo "  Kharej on AWS       : $KHAREJ_IS_AWS"
+  echo "  Iran local IPv4   : $IRAN_LOCAL_IP"
+  echo "  Kharej public IPv4: $KHAREJ_PUBLIC_IP"
+  echo "  Kharej on AWS     : $IS_AWS"
+  echo "  SSH               : $SSH_USER@$KHAREJ_PUBLIC_IP:$SSH_PORT"
   echo
 }
 
@@ -349,13 +329,13 @@ preflight_ssh() {
   spinner_start "Checking TCP connectivity to Kharej:$SSH_PORT"
   if ! check_tcp_port "$KHAREJ_PUBLIC_IP" "$SSH_PORT"; then
     spinner_stop_fail "Checking TCP connectivity to Kharej:$SSH_PORT"
-    die "Port $SSH_PORT is not reachable from Iran."
+    die "Port $SSH_PORT is not reachable."
   fi
-  spinner_stop_ok "TCP port reachable"
+  spinner_stop_ok "TCP reachable"
 
-  spinner_start "Trusting SSH host key (no fingerprint prompts)"
+  spinner_start "Trusting SSH host key (no prompts)"
   if ! ssh_trust_hostkey "$KHAREJ_PUBLIC_IP" "$SSH_PORT"; then
-    spinner_stop_fail "Trusting SSH host key (no fingerprint prompts)"
+    spinner_stop_fail "Trusting SSH host key (no prompts)"
     die "Cannot pre-trust host key."
   fi
   spinner_stop_ok "Host key trusted"
@@ -367,181 +347,217 @@ preflight_ssh() {
   fi
   spinner_stop_ok "SSH login OK"
 
-  # Choose GRE local IP on Kharej
-  if [[ "$KHAREJ_IS_AWS" == "true" ]]; then
-    KHAREJ_LOCAL_GRE_IP="$KHAREJ_PRIVATE_IP"
-    ok "Kharej: local IP for GRE set to PRIVATE IP: $KHAREJ_LOCAL_GRE_IP"
-  else
-    KHAREJ_LOCAL_GRE_IP="$KHAREJ_PUBLIC_IP"
-    ok "Kharej: local IP for GRE set to PUBLIC IP: $KHAREJ_LOCAL_GRE_IP"
-  fi
-
-  # SUDO handling: only if not root
   if [[ "$SSH_USER" == "root" ]]; then
     SUDO_PASS=""
-    ok "Remote: root user detected (no sudo needed)"
-  else
-    # ask once; allow empty => try passwordless sudo (-n)
-    read -r -s -p "Sudo password (one-time) [leave empty if NOPASSWD sudo is enabled]: " SUDO_PASS
-    echo
-    if [[ -n "${SUDO_PASS:-}" ]]; then
-      ok "Sudo password captured"
-    else
-      warn "No sudo password provided; will try passwordless sudo (-n)."
-    fi
+    ok "Remote user is root (no sudo password needed)"
+    return 0
   fi
+
+  # Ask once; not stored anywhere else
+  read -r -s -p "Sudo password (one-time): " SUDO_PASS
+  echo
+  [[ -n "${SUDO_PASS:-}" ]] || die "Sudo password is required for non-root user."
 }
 
-# ---------- Main action ----------
-configure_gre_ipv4() {
-  info "--- Iran Server (Local) Configuration ---"
-  prompt_inputs
-  preflight_ssh
+detect_remote_private_ip_if_needed() {
+  if [[ "$IS_AWS" != "true" ]]; then
+    KHAREJ_PRIVATE_IP=""
+    KHAREJ_GRE_LOCAL_IP="$KHAREJ_PUBLIC_IP"
+    return 0
+  fi
 
-  # Remote payload (Kharej)
-  local remote_payload
-  remote_payload=$(
+  spinner_start "Detecting AWS private IPv4 on remote (ip route get 1.1.1.1)"
+  local payload out_file out ip
+  payload=$(
+    cat <<'EOF'
+set -euo pipefail
+ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}'
+EOF
+  )
+
+  if ! out_file="$(run_remote_payload_b64_capture "$KHAREJ_PUBLIC_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$payload")"; then
+    spinner_stop_fail "Detecting AWS private IPv4 on remote (ip route get 1.1.1.1)"
+    if [[ "$DEBUG" == "true" && -f "$out_file" ]]; then cat "$out_file" >&2; fi
+    rm -f "$out_file" >/dev/null 2>&1 || true
+    die "Could not detect remote private IPv4."
+  fi
+
+  out="$(tr -d '\r' <"$out_file" | tail -n 5)"
+  rm -f "$out_file" >/dev/null 2>&1 || true
+
+  ip="$(echo "$out" | tail -n1 | tr -d '[:space:]')"
+  is_valid_ipv4 "$ip" || {
+    spinner_stop_fail "Detecting AWS private IPv4 on remote (ip route get 1.1.1.1)"
+    die "Remote private IPv4 detection returned invalid value: '$ip'"
+  }
+
+  KHAREJ_PRIVATE_IP="$ip"
+  KHAREJ_GRE_LOCAL_IP="$KHAREJ_PRIVATE_IP"
+  spinner_stop_ok "AWS private IPv4 detected: $KHAREJ_PRIVATE_IP"
+}
+
+configure_remote_gre() {
+  # Remote GRE: name To_IR, address 172.20.20.2/30
+  spinner_start "Configuring GRE on Kharej (remote)"
+  local payload out_file
+
+  payload=$(
     cat <<'EOF'
 set -euo pipefail
 
-command -v ip >/dev/null 2>&1 || { echo "Missing dependency: ip (iproute2)" >&2; exit 20; }
+modprobe ip_gre 2>/dev/null || true
 
-# Ensure GRE module exists (usually built-in, but harmless)
-modprobe ip_gre >/dev/null 2>&1 || true
+# Disable rp_filter (common cause of drops on AWS/NAT paths)
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+# try common nic names (ignore errors)
+sysctl -w net.ipv4.conf.ens5.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.eth0.rp_filter=0 >/dev/null 2>&1 || true
 
-# Clean old tunnel
 ip link show To_IR >/dev/null 2>&1 && ip tunnel del To_IR >/dev/null 2>&1 || true
 
-# Create GRE on Kharej: local=<KHAREJ_LOCAL_GRE_IP> remote=<IRAN_PUBLIC_IP>
-ip tunnel add To_IR mode gre local <KHAREJ_LOCAL_GRE_IP> remote <IRAN_PUBLIC_IP> ttl 255
+ip tunnel add To_IR mode gre remote <IRAN_LOCAL_IP> local <KHAREJ_GRE_LOCAL_IP> ttl 255
 ip addr add 172.20.20.2/30 dev To_IR
 ip link set To_IR mtu 1436
 ip link set To_IR up
 
-# Optional: enable forwarding (doesn't hurt)
-sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
-
-# Show status for debug
-ip -d tunnel show To_IR || true
-ip -o -4 addr show dev To_IR || true
+# show quick status
+ip -d link show To_IR
+ip -4 addr show dev To_IR
 EOF
   )
-  remote_payload="${remote_payload//<KHAREJ_LOCAL_GRE_IP>/$KHAREJ_LOCAL_GRE_IP}"
-  remote_payload="${remote_payload//<IRAN_PUBLIC_IP>/$IRAN_IP}"
 
-  spinner_start "Configuring Kharej server (remote GRE setup)"
-  local log=""
-  if ! log="$(run_remote_payload_b64_capture "$KHAREJ_PUBLIC_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_payload")"; then
-    spinner_stop_fail "Configuring Kharej server (remote GRE setup)"
-    echo -e "${RED}Remote output:${NC}" >&2
-    if [[ -n "${log:-}" && -f "$log" ]]; then
-      cat "$log" >&2
-      rm -f "$log" >/dev/null 2>&1 || true
-    else
-      echo "(no remote log captured)" >&2
+  payload="${payload//<IRAN_LOCAL_IP>/$IRAN_LOCAL_IP}"
+  payload="${payload//<KHAREJ_GRE_LOCAL_IP>/$KHAREJ_GRE_LOCAL_IP}"
+
+  if ! out_file="$(run_remote_payload_b64_capture "$KHAREJ_PUBLIC_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$payload")"; then
+    spinner_stop_fail "Configuring GRE on Kharej (remote)"
+    if [[ "$DEBUG" == "true" && -f "$out_file" ]]; then
+      echo -e "${RED}Remote output (debug):${NC}" >&2
+      cat "$out_file" >&2
     fi
+    rm -f "$out_file" >/dev/null 2>&1 || true
     die "Remote GRE configuration failed."
   fi
-  spinner_stop_ok "Kharej configured"
 
-  if [[ "$DEBUG" == "true" && -f "$log" ]]; then
+  if [[ "$DEBUG" == "true" && -f "$out_file" ]]; then
     echo -e "${CYAN}Remote output (debug):${NC}"
-    cat "$log" || true
+    cat "$out_file" || true
   fi
-  rm -f "$log" >/dev/null 2>&1 || true
+  rm -f "$out_file" >/dev/null 2>&1 || true
+  spinner_stop_ok "Remote GRE configured"
+}
 
-  # Local (Iran) GRE
-  spinner_start "Configuring Iran GRE interface"
+configure_local_gre() {
+  # Local GRE: name To_Kharej, address 172.20.20.1/30
+  spinner_start "Configuring GRE on Iran (local)"
+  modprobe ip_gre 2>/dev/null || true
+
+  # Disable rp_filter locally too (safer)
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+  sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+
   del_tunnel_if_exists "To_Kharej"
-
-  # Iran always uses remote=Kharej PUBLIC (reachable on Internet)
-  ip tunnel add To_Kharej mode gre local "$IRAN_IP" remote "$KHAREJ_PUBLIC_IP" ttl 255
+  ip tunnel add To_Kharej mode gre remote "$KHAREJ_PUBLIC_IP" local "$IRAN_LOCAL_IP" ttl 255
   ip addr add 172.20.20.1/30 dev To_Kharej
   ip link set To_Kharej mtu 1436
   ip link set To_Kharej up
-  spinner_stop_ok "Iran GRE interface configured"
+  spinner_stop_ok "Local GRE configured"
+}
 
-  spinner_start "Enabling forwarding (Iran)"
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  spinner_stop_ok "Forwarding enabled"
-
-  spinner_start "Testing tunnel from Iran (ping 172.20.20.2)"
-  if ping -c 3 -W 2 172.20.20.2 >/dev/null 2>&1; then
-    spinner_stop_ok "Ping OK (Iran -> Kharej)"
-  else
-    spinner_stop_fail "Ping failed (Iran -> Kharej)"
-    warn "Tunnel interface may exist, but traffic isn't passing."
-  fi
-
-  # Also test reverse from Kharej -> Iran (helps a lot for AWS debugging)
-  spinner_start "Testing tunnel from Kharej (ping 172.20.20.1)"
-  local test_cmd
-  test_cmd="ping -c 3 -W 2 172.20.20.1 >/dev/null 2>&1 && echo OK || echo FAIL"
-  local out_file=""
-  if out_file="$(remote_exec_capture "$KHAREJ_PUBLIC_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$test_cmd")"; then
-    if grep -q "OK" "$out_file" 2>/dev/null; then
-      spinner_stop_ok "Reverse ping OK (Kharej -> Iran)"
-    else
-      spinner_stop_fail "Reverse ping failed (Kharej -> Iran)"
-      warn "Check firewall / security group / protocol 47 (GRE)."
-    fi
-  else
-    spinner_stop_fail "Reverse ping test (SSH command failed)"
-    warn "Could not run reverse ping test."
-  fi
-  [[ -n "${out_file:-}" && -f "$out_file" ]] && rm -f "$out_file" >/dev/null 2>&1 || true
-
+test_link() {
   echo
-  warn "AWS reminder (only if AWS=true): Security Group + NACL must allow GRE (Protocol 47) inbound/outbound."
-  ok "END."
+  info "Testing GRE link (ICMP over tunnel)..."
+
+  spinner_start "Ping remote tunnel IP (172.20.20.2)"
+  if ping -c 5 -W 2 172.20.20.2 >/dev/null 2>&1; then
+    spinner_stop_ok "Tunnel ping OK"
+    ok "GRE link is UP (172.20.20.1 <-> 172.20.20.2)."
+  else
+    spinner_stop_fail "Tunnel ping FAILED"
+    warn "GRE interface is configured, but ICMP did not pass."
+
+    echo
+    echo "Quick diagnostics you can run:"
+    echo "  Local:  ip -d link show To_Kharej"
+    echo "  Local:  tcpdump -ni <public-if> proto 47"
+    echo "  Remote: tcpdump -ni <nic> proto 47"
+    echo "  Remote: tcpdump -ni To_IR icmp"
+    echo
+    echo "Common causes on AWS:"
+    echo "  - Using PUBLIC IP as 'local' on the EC2 side (must be PRIVATE IPv4)."
+    echo "  - rp_filter not disabled (this script disables it)."
+    echo "  - SecurityGroup/NACL blocking GRE (proto 47) (but if you see GRE packets, inbound is ok)."
+  fi
 }
 
 show_status() {
   echo
   echo -e "${CYAN}${BOLD}=== Status (Local) ===${NC}"
   echo "Version: ${SCRIPT_VERSION}"
-  echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo N/A)"
+  echo "Iran local IPv4    : ${IRAN_LOCAL_IP:-N/A}"
+  echo "Kharej public IPv4 : ${KHAREJ_PUBLIC_IP:-N/A}"
+  echo "Kharej private IPv4: ${KHAREJ_PRIVATE_IP:-N/A}"
+  echo "Kharej GRE local IP: ${KHAREJ_GRE_LOCAL_IP:-N/A}"
   echo
 
-  echo -e "${BOLD}Interfaces:${NC}"
-  for ifc in To_Kharej; do
-    if ip link show "$ifc" >/dev/null 2>&1; then
-      echo "  - $ifc: PRESENT"
-      ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print "      IPv4:", $4}'
-      ip -o link show "$ifc" 2>/dev/null | sed 's/^[0-9]\+:\s*//'
-    else
-      echo "  - $ifc: MISSING"
-    fi
-  done
+  echo -e "${BOLD}Local GRE interface:${NC}"
+  if ip link show To_Kharej >/dev/null 2>&1; then
+    ip -d link show To_Kharej || true
+    ip -4 addr show dev To_Kharej || true
+  else
+    echo "  To_Kharej: MISSING"
+  fi
   echo
 
-  echo -e "${BOLD}ip tunnel show:${NC}"
+  echo -e "${BOLD}Local tunnels:${NC}"
   ip tunnel show 2>/dev/null || true
+  echo
+
+  echo -e "${BOLD}rp_filter (local):${NC}"
+  echo "  all     : $(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo N/A)"
+  echo "  default : $(sysctl -n net.ipv4.conf.default.rp_filter 2>/dev/null || echo N/A)"
   echo
 }
 
-show_info() {
-  echo -e "${CYAN}GRE Tunnel Wizard (IPv4)${NC}"
-  echo "Created by: Hamed Jafari"
-  echo "Version: ${SCRIPT_VERSION}"
-  echo "Behavior:"
-  echo "  - Asks if Kharej is AWS (default false)."
-  echo "  - AWS=false: uses Kharej PUBLIC IP as GRE local (old behavior)."
-  echo "  - AWS=true : uses Kharej PRIVATE IP as GRE local (AWS-safe)."
+configure_gre_link() {
+  info "--- Iran Server (Local) Configuration ---"
+  prompt_inputs
+  preflight_ssh
+  detect_remote_private_ip_if_needed
+
+  echo
+  ok "Using Kharej GRE local IP: $KHAREJ_GRE_LOCAL_IP"
+  if [[ "$IS_AWS" == "true" ]]; then
+    ok "AWS mode: remote GRE local=PRIVATE, remote reachable via PUBLIC"
+  else
+    ok "Normal mode: remote GRE local=PUBLIC"
+  fi
+  echo
+
+  configure_remote_gre
+  configure_local_gre
+  test_link
 }
 
 main_menu() {
   print_banner
-  echo "1) Configure GRE (IPv4)"
-  echo "2) Status"
+  echo "1) Configure GRE Link (IPv4) [SAFE]"
+  echo "2) Status (Local)"
   echo "3) Info"
   echo "0) Exit"
   echo
   read -r -p "Select: " choice
   case "$choice" in
-    1) configure_gre_ipv4; pause ;;
+    1) configure_gre_link; pause ;;
     2) show_status; pause ;;
-    3) show_info; pause ;;
+    3)
+      echo "GRE Link Wizard (IPv4) - Normal + AWS EC2"
+      echo "Version: ${SCRIPT_VERSION}"
+      echo "Creates only the GRE link and verifies it with ping."
+      echo "Does NOT apply NAT/DNAT rules."
+      pause
+      ;;
     0) exit 0 ;;
     *) echo -e "${RED}Invalid option.${NC}"; pause ;;
   esac
