@@ -157,9 +157,13 @@ check_tcp_port() {
   nc -zvw3 "$host" "$port" >/dev/null 2>&1
 }
 
+# NOTE: -tt forces a pseudo-tty (helps sudo -i flows on some setups)
+SSH_TTY_OPTS=(-tt)
+
 ssh_run_password() {
   local host="$1" port="$2" user="$3" pass="$4" remote="$5"
-  timeout 40 sshpass -p "$pass" ssh -p "$port" \
+  timeout 60 sshpass -p "$pass" ssh -p "$port" \
+    "${SSH_TTY_OPTS[@]}" \
     "${SSH_OPTS_COMMON[@]}" \
     -o BatchMode=no \
     -o PreferredAuthentications=password \
@@ -171,7 +175,8 @@ ssh_run_password() {
 
 ssh_run_key() {
   local host="$1" port="$2" user="$3" remote="$4"
-  timeout 40 ssh -p "$port" \
+  timeout 60 ssh -p "$port" \
+    "${SSH_TTY_OPTS[@]}" \
     "${SSH_OPTS_COMMON[@]}" \
     -o BatchMode=yes \
     -o PreferredAuthentications=publickey \
@@ -189,38 +194,34 @@ ssh_login_check() {
   fi
 }
 
-# ---------- Remote sudo handling ----------
-# Rule:
-# - If remote user is root => run directly.
+# ---------- Remote privilege escalation ----------
+# Behavior:
+# - If remote user is root -> run directly
 # - Else:
-#   - Try passwordless sudo first (sudo -n).
-#   - If that fails and SUDO_PASS is available => feed it via sudo -S.
-#   - If no SUDO_PASS => fail with clear message.
-remote_build_command() {
-  local cmd="$1"
+#   - Try sudo -n (passwordless)
+#   - Else use SUDO_PASS with sudo -S, and run inside sudo -i (login shell)
+remote_wrapper_template() {
   cat <<'EOS'
 set -euo pipefail
-CMD_TO_RUN_B64="<B64>"
-decode_cmd() { printf "%s" "$CMD_TO_RUN_B64" | base64 -d; }
+CMD_B64="<CMD_B64>"
+
+decode_cmd() { printf "%s" "$CMD_B64" | base64 -d; }
 
 if [[ "$(id -u)" -eq 0 ]]; then
   bash -lc "$(decode_cmd)"
   exit 0
 fi
 
-# not root:
 if sudo -n true >/dev/null 2>&1; then
-  sudo bash -lc "$(decode_cmd)"
+  sudo -i bash -lc "$(decode_cmd)"
   exit 0
 fi
 
 if [[ -n "${SUDO_PASS:-}" ]]; then
-  # Try sudo with password (no prompt)
-  printf "%s\n" "$SUDO_PASS" | sudo -S -p "" true >/dev/null 2>&1 || {
-    echo "SUDO_AUTH_FAILED" >&2
-    exit 51
-  }
-  printf "%s\n" "$SUDO_PASS" | sudo -S -p "" bash -lc "$(decode_cmd)"
+  # validate sudo password silently
+  printf "%s\n" "$SUDO_PASS" | sudo -S -p "" true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
+  # run as root login shell
+  printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash -lc "$(decode_cmd)"
   exit 0
 fi
 
@@ -230,22 +231,22 @@ EOS
 }
 
 run_remote_capture() {
-  local host="$1" port="$2" user="$3" pass="$4" sudo_pass="$5" cmd="$6"
+  local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" cmd="$6"
   local tmp; tmp="$(mktemp)"
 
   local cmd_b64; cmd_b64="$(printf "%s" "$cmd" | base64 -w0)"
-  local wrapper; wrapper="$(remote_build_command "$cmd")"
-  wrapper="${wrapper//<B64>/$cmd_b64}"
+  local wrapper; wrapper="$(remote_wrapper_template)"
+  wrapper="${wrapper//<CMD_B64>/$cmd_b64}"
 
-  # export SUDO_PASS into the remote shell environment safely
-  # (value may be empty; that's ok)
+  # Export SUDO_PASS into remote environment (quoted safely)
   local remote="SUDO_PASS=$(printf "%q" "${sudo_pass:-}") bash -lc $(printf "%q" "$wrapper")"
 
-  if [[ -n "${pass:-}" ]]; then
-    ssh_run_password "$host" "$port" "$user" "$pass" "$remote" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
+  if [[ -n "${ssh_pass:-}" ]]; then
+    ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
   else
     ssh_run_key "$host" "$port" "$user" "$remote" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
   fi
+
   echo "$tmp"
 }
 
@@ -325,13 +326,14 @@ prompt_iran_kharej_ipv4_and_ssh() {
   read -r -s -p "SSH password (leave empty if using SSH key): " SSH_PASS
   echo
 
-  # sudo password behavior:
-  # - if SSH_PASS provided, reuse it by default (per your workflow).
-  # - if SSH_PASS empty, leave SUDO_PASS empty; remote must have passwordless sudo.
-  read -r -s -p "Sudo password on Kharej (leave empty to reuse SSH password): " SUDO_PASS
-  echo
-  if [[ -z "${SUDO_PASS:-}" && -n "${SSH_PASS:-}" ]]; then
+  # sudo password policy:
+  # - If SSH password exists => reuse it automatically as sudo password (no second prompt)
+  # - If SSH password is empty => ask once for sudo password (needed for sudo -i)
+  if [[ -n "${SSH_PASS:-}" ]]; then
     SUDO_PASS="$SSH_PASS"
+  else
+    read -r -s -p "Sudo password on Kharej (required for sudo -i): " SUDO_PASS
+    echo
   fi
 
   read -r -p "Debug logs on failure? (true/false) [false]: " DEBUG
@@ -369,14 +371,6 @@ preflight_ssh() {
 configure_gre_ipv4() {
   info "--- Iran Server (Local) Configuration ---"
   prompt_iran_kharej_ipv4_and_ssh
-
-  echo
-  echo "Summary:"
-  echo "  Iran IPv4  : $IRAN_IP"
-  echo "  Kharej IPv4: $KHAREJ_IP"
-  echo "  SSH        : $SSH_USER@$KHAREJ_IP:$SSH_PORT"
-  echo
-
   preflight_ssh
 
   local remote_cmd
@@ -405,16 +399,16 @@ EOF
   remote_cmd="${remote_cmd//<IP_IRAN>/$IRAN_IP}"
   remote_cmd="${remote_cmd//<IP_KHAREJ>/$KHAREJ_IP}"
 
-  spinner_start "Configuring Kharej server (remote GRE setup)"
+  spinner_start "Configuring Kharej server (remote GRE setup via sudo -i)"
   local out=""
   if ! out="$(run_remote_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_cmd")"; then
-    spinner_stop_fail "Configuring Kharej server (remote GRE setup)"
+    spinner_stop_fail "Configuring Kharej server (remote GRE setup via sudo -i)"
     if [[ "$DEBUG" == "true" ]]; then
       echo -e "${RED}Remote output (debug):${NC}"
       cat "$out" >&2
     fi
     rm -f "$out" 2>/dev/null || true
-    die "Remote GRE configuration failed (sudo/root issue or command failed)."
+    die "Remote GRE configuration failed."
   fi
   rm -f "$out" 2>/dev/null || true
   spinner_stop_ok "Kharej configured"
@@ -456,7 +450,6 @@ configure_ipv6_sit_and_ip6gre() {
   prompt_iran_kharej_ipv4_and_ssh
   preflight_ssh
 
-  # Remote SIT
   local remote_sit
   remote_sit=$(
     cat <<'EOF'
@@ -484,22 +477,21 @@ EOF
   remote_sit="${remote_sit//<IPv4_KHAREJ>/$KHAREJ_IP}"
   remote_sit="${remote_sit//<V6_KHAREJ>/$V6_KHAREJ}"
 
-  spinner_start "Configuring Kharej SIT (6to4_To_IR) + IPv6 addr"
+  spinner_start "Configuring Kharej SIT (via sudo -i)"
   local out=""
   if ! out="$(run_remote_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_sit")"; then
-    spinner_stop_fail "Configuring Kharej SIT (6to4_To_IR) + IPv6 addr"
+    spinner_stop_fail "Configuring Kharej SIT (via sudo -i)"
     if [[ "$DEBUG" == "true" ]]; then
       echo -e "${RED}Remote output (debug):${NC}"
       cat "$out" >&2
     fi
     rm -f "$out" 2>/dev/null || true
-    die "Remote SIT configuration failed (sudo/root issue or command failed)."
+    die "Remote SIT configuration failed."
   fi
   rm -f "$out" 2>/dev/null || true
   spinner_stop_ok "Kharej SIT configured"
 
-  # Local SIT
-  spinner_start "Configuring Iran SIT (6to4_To_KH) + IPv6 addr"
+  spinner_start "Configuring Iran SIT"
   del_tunnel_if_exists_v4 "6to4_To_KH"
   ip tunnel add 6to4_To_KH mode sit remote "$KHAREJ_IP" local "$IRAN_IP"
   ip -6 addr add "$V6_IRAN/64" dev 6to4_To_KH
@@ -516,7 +508,6 @@ EOF
     warn "Continuing anyway."
   fi
 
-  # Remote GRE over IPv6
   local remote_ip6gre
   remote_ip6gre=$(
     cat <<'EOF'
@@ -533,21 +524,20 @@ EOF
   remote_ip6gre="${remote_ip6gre//<V6_IRAN>/$V6_IRAN}"
   remote_ip6gre="${remote_ip6gre//<V6_KHAREJ>/$V6_KHAREJ}"
 
-  spinner_start "Configuring Kharej GRE over IPv6 (GRE6Tun_To_IR)"
+  spinner_start "Configuring Kharej GRE over IPv6 (via sudo -i)"
   if ! out="$(run_remote_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_ip6gre")"; then
-    spinner_stop_fail "Configuring Kharej GRE over IPv6 (GRE6Tun_To_IR)"
+    spinner_stop_fail "Configuring Kharej GRE over IPv6 (via sudo -i)"
     if [[ "$DEBUG" == "true" ]]; then
       echo -e "${RED}Remote output (debug):${NC}"
       cat "$out" >&2
     fi
     rm -f "$out" 2>/dev/null || true
-    die "Remote ip6gre configuration failed (sudo/root issue or command failed)."
+    die "Remote ip6gre configuration failed."
   fi
   rm -f "$out" 2>/dev/null || true
   spinner_stop_ok "Kharej GRE6 configured"
 
-  # Local GRE over IPv6
-  spinner_start "Configuring Iran GRE over IPv6 (GRE6Tun_To_KH)"
+  spinner_start "Configuring Iran GRE over IPv6"
   del_tunnel_if_exists_v6 "GRE6Tun_To_KH"
   ip -6 tunnel add GRE6Tun_To_KH mode ip6gre remote "$V6_KHAREJ" local "$V6_IRAN"
   ip addr add 172.20.20.1/30 dev GRE6Tun_To_KH
@@ -586,40 +576,24 @@ show_settings_status() {
   echo "  SIT test      : ping6 -c 3 $V6_KHAREJ"
   echo "  GRE6 test     : ping -c 3 172.20.20.2"
   echo
-
-  echo -e "${BOLD}Tunnels summary${NC}"
-  echo "  ip tunnel show:"
-  ip tunnel show 2>/dev/null || true
-  echo
-  echo "  ip -6 tunnel show:"
-  ip -6 tunnel show 2>/dev/null || true
-  echo
-
-  echo -e "${BOLD}NAT/Forwarding${NC}"
-  echo "  net.ipv4.ip_forward = $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo N/A)"
-  echo "  iptables -t nat (relevant lines):"
-  iptables -t nat -S 2>/dev/null | grep -E 'PREROUTING|POSTROUTING|DNAT|MASQUERADE' || true
-  echo
 }
 
 show_info() {
   echo -e "${CYAN}GRE Tunnel Wizard${NC}"
   echo "Created by: Hamed Jafari"
-  echo "Configures:"
-  echo "  1) GRE (IPv4) between Iran and Kharej via SSH"
-  echo "  2) IPv6: SIT over IPv4 + GRE over IPv6 (ip6gre) using fde8:b030:25cf::/64"
   echo
-  echo "Remote privilege handling:"
-  echo "  - If SSH user is not root: uses sudo automatically."
-  echo "  - Tries passwordless sudo first."
-  echo "  - If needed: uses provided sudo password (defaults to SSH password)."
+  echo "Remote privilege behavior:"
+  echo "  - If SSH user is root: runs directly"
+  echo "  - Else: runs via 'sudo -i' automatically"
+  echo "  - If SSH password is provided: reuses it for sudo (no second prompt)"
+  echo "  - If SSH key auth is used: asks once for sudo password"
 }
 
 main_menu() {
   print_banner
   echo "1) Configure GRE (IPv4)"
   echo "2) Configure IPv6 (SIT + GRE-over-IPv6)"
-  echo "3) Settings / Status (show active tunnels)"
+  echo "3) Settings / Status"
   echo "4) Info"
   echo "0) Exit"
   echo
