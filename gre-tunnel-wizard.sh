@@ -185,6 +185,16 @@ ssh_login_check() {
   fi
 }
 
+remote_check_sudo_password_key() {
+  local host="$1" port="$2" user="$3" pass="$4"
+  timeout 60 ssh -p "$port" "${SSH_TTY_OPTS[@]}" "${SSH_OPTS_COMMON[@]}" \
+    -o BatchMode=yes \
+    -o PreferredAuthentications=publickey \
+    -o PasswordAuthentication=no \
+    -o NumberOfPasswordPrompts=0 \
+    "$user@$host" "printf '%s\n' $(printf "%q" "$pass") | sudo -S -p '' -k true >/dev/null 2>&1; echo \$?"
+}
+
 # ---------- Remote payload runner (base64 + sudo -i) ----------
 run_remote_payload_b64_capture() {
   local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" payload="$6"
@@ -219,7 +229,7 @@ run_as_root() {
   fi
 
   if [[ -n "$SUDO_PASS" ]]; then
-    printf "%s\n" "$SUDO_PASS" | sudo -S -p "" true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
+    printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -k true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
     printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash "$PAY"
     exit 0
   fi
@@ -334,21 +344,24 @@ preflight_ssh() {
   fi
   spinner_stop_ok "SSH login OK"
 
-  # One-time password collection for sudo (store in variable, do not re-ask)
   if [[ "$SSH_USER" == "root" ]]; then
     SUDO_PASS=""
     ok "Remote: root user detected"
-  else
-    if [[ -n "${SSH_PASS:-}" ]]; then
-      SUDO_PASS="$SSH_PASS"
-      ok "Remote: sudo password set from SSH password"
-    else
-      read -r -s -p "Sudo password on Kharej (one-time): " SUDO_PASS
-      echo
-      [[ -n "${SUDO_PASS:-}" ]] || die "Sudo password is required for remote sudo -i."
-      ok "Remote: sudo password captured"
-    fi
+    return 0
   fi
+
+  read -r -s -p "Sudo password (one-time): " SUDO_PASS
+  echo
+  [[ -n "${SUDO_PASS:-}" ]] || die "Sudo password is required."
+
+  spinner_start "Validating sudo password (sudo -k)"
+  local rc
+  rc="$(remote_check_sudo_password_key "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SUDO_PASS" | tr -d '\r' | tail -n1 || true)"
+  if [[ "$rc" != "0" ]]; then
+    spinner_stop_fail "Validating sudo password (sudo -k)"
+    die "Sudo password invalid or user has no sudo."
+  fi
+  spinner_stop_ok "Sudo password OK"
 }
 
 # ---------- Main action ----------
