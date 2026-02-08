@@ -185,14 +185,26 @@ ssh_login_check() {
   fi
 }
 
-remote_check_sudo_password_key() {
-  local host="$1" port="$2" user="$3" pass="$4"
-  timeout 60 ssh -p "$port" "${SSH_TTY_OPTS[@]}" "${SSH_OPTS_COMMON[@]}" \
-    -o BatchMode=yes \
-    -o PreferredAuthentications=publickey \
-    -o PasswordAuthentication=no \
-    -o NumberOfPasswordPrompts=0 \
-    "$user@$host" "printf '%s\n' $(printf "%q" "$pass") | sudo -S -p '' -k true >/dev/null 2>&1; echo \$?"
+remote_exec_capture() {
+  # captures stdout+stderr into a tmp file and returns path
+  local host="$1" port="$2" user="$3" ssh_pass="$4" cmd="$5"
+  local tmp; tmp="$(mktemp)"
+  if [[ -n "${ssh_pass:-}" ]]; then
+    ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$cmd" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
+  else
+    ssh_run_key "$host" "$port" "$user" "$cmd" >"$tmp" 2>&1 || { echo "$tmp"; return 1; }
+  fi
+  echo "$tmp"
+}
+
+remote_check_sudo_password() {
+  local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5"
+  # -k forces password prompt even if cached
+  local cmd
+  cmd="printf '%s\n' $(printf "%q" "$sudo_pass") | sudo -S -p '' -k true >/dev/null 2>&1; echo \$?"
+  local out
+  out="$(remote_exec_capture "$host" "$port" "$user" "$ssh_pass" "$cmd")" || { echo "$out"; return 1; }
+  echo "$out"
 }
 
 # ---------- Remote payload runner (base64 + sudo -i) ----------
@@ -229,6 +241,7 @@ run_as_root() {
   fi
 
   if [[ -n "$SUDO_PASS" ]]; then
+    # -k to avoid cached timestamps masking bad passwords
     printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -k true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
     printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash "$PAY"
     exit 0
@@ -271,7 +284,7 @@ add_iptables_rule_once() {
 }
 
 # ---------- Globals ----------
-IRAN_IP=""; KHAREJ_IP=""; SSH_PORT="22"; SSH_USER="ubuntu"; SSH_PASS=""; SUDO_PASS=""; DEBUG="false"
+IRAN_IP=""; KHAREJ_IP=""; SSH_PORT="22"; SSH_USER="root"; SSH_PASS=""; SUDO_PASS=""; DEBUG="false"
 
 prompt_inputs() {
   local detected is_auto
@@ -305,8 +318,8 @@ prompt_inputs() {
   read -r -p "SSH port [22]: " SSH_PORT
   SSH_PORT="${SSH_PORT:-22}"
 
-  read -r -p "SSH user [ubuntu]: " SSH_USER
-  SSH_USER="${SSH_USER:-ubuntu}"
+  read -r -p "SSH user [root]: " SSH_USER
+  SSH_USER="${SSH_USER:-root}"
 
   read -r -s -p "SSH password (leave empty if using SSH key): " SSH_PASS
   echo
@@ -355,8 +368,15 @@ preflight_ssh() {
   [[ -n "${SUDO_PASS:-}" ]] || die "Sudo password is required."
 
   spinner_start "Validating sudo password (sudo -k)"
-  local rc
-  rc="$(remote_check_sudo_password_key "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SUDO_PASS" | tr -d '\r' | tail -n1 || true)"
+  local out rc
+  out="$(remote_check_sudo_password "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS")" || {
+    spinner_stop_fail "Validating sudo password (sudo -k)"
+    if [[ "$DEBUG" == "true" && -f "$out" ]]; then cat "$out" >&2; rm -f "$out" >/dev/null 2>&1 || true; fi
+    die "SSH failed during sudo validation."
+  }
+  rc="$(tr -d '\r' <"$out" | tail -n1 || true)"
+  rm -f "$out" >/dev/null 2>&1 || true
+
   if [[ "$rc" != "0" ]]; then
     spinner_stop_fail "Validating sudo password (sudo -k)"
     die "Sudo password invalid or user has no sudo."
@@ -392,13 +412,10 @@ EOF
   local log=""
   if ! log="$(run_remote_payload_b64_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_payload")"; then
     spinner_stop_fail "Configuring Kharej server (remote GRE setup via sudo -i)"
-    echo -e "${RED}Remote output (debug):${NC}" >&2
-    if [[ -n "${log:-}" && -f "$log" ]]; then
+    if [[ "$DEBUG" == "true" && -f "$log" ]]; then
       cat "$log" >&2
-      rm -f "$log" >/dev/null 2>&1 || true
-    else
-      echo "(no remote log file captured)" >&2
     fi
+    rm -f "$log" >/dev/null 2>&1 || true
     die "Remote GRE configuration failed."
   fi
   spinner_stop_ok "Kharej configured"
