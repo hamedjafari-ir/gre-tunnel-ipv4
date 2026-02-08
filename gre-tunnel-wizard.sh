@@ -97,29 +97,17 @@ detect_ipv4() {
   echo "${ip:-}"
 }
 
-# ---------- deps ----------
-APT_UPDATED=0
-apt_update_once() {
-  if [[ "$APT_UPDATED" -eq 0 ]]; then
-    apt-get update -y >/dev/null 2>&1 || true
-    APT_UPDATED=1
-  fi
-}
-
+# ---------- deps (no apt update/upgrade) ----------
 ensure_local_deps() {
-  if command_exists apt-get; then
-    spinner_start "Checking/Installing dependencies (local)"
-    apt_update_once
-    apt-get install -y iproute2 iptables openssh-client iputils-ping netcat-openbsd sshpass >/dev/null 2>&1 || true
-    spinner_stop_ok "Dependencies ready"
-  else
-    command_exists ip       || die "'ip' is missing."
-    command_exists iptables || die "'iptables' is missing."
-    command_exists ssh      || die "'ssh' is missing."
-    command_exists ping     || die "'ping' is missing."
-    command_exists nc       || die "'nc' is missing."
-    command_exists sshpass  || die "'sshpass' is missing."
-    command_exists timeout  || die "'timeout' is missing."
+  command_exists ip       || die "'ip' is missing (iproute2)."
+  command_exists iptables || die "'iptables' is missing."
+  command_exists ssh      || die "'ssh' is missing."
+  command_exists ping     || die "'ping' is missing."
+  command_exists nc       || die "'nc' is missing."
+  command_exists timeout  || die "'timeout' is missing."
+  command_exists base64   || die "'base64' is missing."
+  if command_exists sshpass; then :; else
+    warn "'sshpass' not found. Password SSH won't work (key auth is fine)."
   fi
 }
 
@@ -159,8 +147,8 @@ check_tcp_port() {
 }
 
 ssh_run_password() {
-  local host="$1" port="$2" user="$3" pass="$4"
-  shift 4
+  local host="$1" port="$2" user="$3" pass="$4" remote="$5"
+  command_exists sshpass || die "sshpass not installed but SSH password provided."
   timeout 90 sshpass -p "$pass" ssh -p "$port" \
     "${SSH_TTY_OPTS[@]}" \
     "${SSH_OPTS_COMMON[@]}" \
@@ -169,12 +157,11 @@ ssh_run_password() {
     -o PubkeyAuthentication=no \
     -o PasswordAuthentication=yes \
     -o NumberOfPasswordPrompts=1 \
-    "$user@$host" "$@"
+    "$user@$host" "$remote"
 }
 
 ssh_run_key() {
-  local host="$1" port="$2" user="$3"
-  shift 3
+  local host="$1" port="$2" user="$3" remote="$4"
   timeout 90 ssh -p "$port" \
     "${SSH_TTY_OPTS[@]}" \
     "${SSH_OPTS_COMMON[@]}" \
@@ -182,7 +169,7 @@ ssh_run_key() {
     -o PreferredAuthentications=publickey \
     -o PasswordAuthentication=no \
     -o NumberOfPasswordPrompts=0 \
-    "$user@$host" "$@"
+    "$user@$host" "$remote"
 }
 
 ssh_login_check() {
@@ -194,66 +181,63 @@ ssh_login_check() {
   fi
 }
 
-# ---------- Remote exec (robust: send wrapper + payload via stdin) ----------
-run_remote_capture() {
+# ---------- Remote exec (payload via base64) ----------
+run_remote_payload_b64() {
   local host="$1" port="$2" user="$3" ssh_pass="$4" sudo_pass="$5" payload="$6"
   local tmp; tmp="$(mktemp)"
 
-  local remote_cmd="SUDO_PASS=$(printf "%q" "${sudo_pass:-}") bash -s"
-  local wrapper
-  wrapper="$(cat <<'WRAP'
-set -euo pipefail
+  local payload_b64
+  payload_b64="$(printf "%s" "$payload" | base64 -w0)"
 
-PAYLOAD="/tmp/gre_payload_$$.sh"
-cleanup() { rm -f "$PAYLOAD" >/dev/null 2>&1 || true; }
+  # Remote script: write payload file from base64, then run it as root if needed
+  local remote_script
+  remote_script="$(cat <<'RS'
+set -euo pipefail
+PAYLOAD_B64="$PAYLOAD_B64"
+SUDO_PASS="${SUDO_PASS:-}"
+
+PAY="/tmp/gre_payload_$$.sh"
+cleanup() { rm -f "$PAY" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-# Read payload from stdin marker into a file
-# shellcheck disable=SC2016
-awk 'BEGIN{p=0} $0=="__PAYLOAD_BELOW__"{p=1; next} {if(p) print}' >"$PAYLOAD"
-chmod +x "$PAYLOAD"
+printf "%s" "$PAYLOAD_B64" | base64 -d >"$PAY"
+chmod +x "$PAY"
 
-run_payload() { bash "$PAYLOAD"; }
+run_as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    bash "$PAY"
+    exit 0
+  fi
 
-if [[ "$(id -u)" -eq 0 ]]; then
-  run_payload
-  exit 0
-fi
+  if sudo -n true >/dev/null 2>&1; then
+    sudo -i bash "$PAY"
+    exit 0
+  fi
 
-if sudo -n true >/dev/null 2>&1; then
-  sudo -i bash "$PAYLOAD"
-  exit 0
-fi
+  if [[ -n "$SUDO_PASS" ]]; then
+    printf "%s\n" "$SUDO_PASS" | sudo -S -p "" true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
+    printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash "$PAY"
+    exit 0
+  fi
 
-if [[ -n "${SUDO_PASS:-}" ]]; then
-  printf "%s\n" "$SUDO_PASS" | sudo -S -p "" true >/dev/null 2>&1 || { echo "SUDO_AUTH_FAILED" >&2; exit 51; }
-  printf "%s\n" "$SUDO_PASS" | sudo -S -p "" -i bash "$PAYLOAD"
-  exit 0
-fi
+  echo "SUDO_REQUIRED_NO_PASSWORD" >&2
+  exit 52
+}
 
-echo "SUDO_REQUIRED_NO_PASSWORD" >&2
-exit 52
-
-__PAYLOAD_BELOW__
-WRAP
+run_as_root
+RS
 )"
 
-  # Send: wrapper + payload (payload must be after marker)
+  # We avoid stdin games: pass vars and execute a simple bash -lc
+  local remote_cmd="PAYLOAD_B64=$(printf "%q" "$payload_b64") SUDO_PASS=$(printf "%q" "${sudo_pass:-}") bash -lc $(printf "%q" "$remote_script")"
+
   if [[ -n "${ssh_pass:-}" ]]; then
-    if ! ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote_cmd" >"$tmp" 2>&1 <<EOF
-$wrapper
-$payload
-EOF
-    then
+    if ! ssh_run_password "$host" "$port" "$user" "$ssh_pass" "$remote_cmd" >"$tmp" 2>&1; then
       echo "$tmp"
       return 1
     fi
   else
-    if ! ssh_run_key "$host" "$port" "$user" "$remote_cmd" >"$tmp" 2>&1 <<EOF
-$wrapper
-$payload
-EOF
-    then
+    if ! ssh_run_key "$host" "$port" "$user" "$remote_cmd" >"$tmp" 2>&1; then
       echo "$tmp"
       return 1
     fi
@@ -262,7 +246,7 @@ EOF
   echo "$tmp"
 }
 
-# ---------- helpers ----------
+# ---------- idempotent helpers ----------
 del_tunnel_if_exists() {
   local name="$1"
   ip link show "$name" >/dev/null 2>&1 && ip tunnel del "$name" >/dev/null 2>&1 || true
@@ -311,17 +295,14 @@ prompt_inputs() {
   read -r -s -p "SSH password (leave empty if using SSH key): " SSH_PASS
   echo
 
-  # If remote user isn't root:
-  # - If SSH password exists: reuse it for sudo (no second prompt)
-  # - Else: ask once for sudo password (unless passwordless sudo exists)
+  # If remote user isn't root and SSH password is empty (key auth), we need sudo password once.
   SUDO_PASS=""
-  if [[ "${SSH_USER}" != "root" ]]; then
-    if [[ -n "${SSH_PASS:-}" ]]; then
-      SUDO_PASS="$SSH_PASS"
-    else
-      read -r -s -p "Sudo password on Kharej (leave empty if passwordless sudo): " SUDO_PASS
-      echo
-    fi
+  if [[ "${SSH_USER}" != "root" && -z "${SSH_PASS:-}" ]]; then
+    read -r -s -p "Sudo password on Kharej (required unless passwordless sudo): " SUDO_PASS
+    echo
+  elif [[ "${SSH_USER}" != "root" && -n "${SSH_PASS:-}" ]]; then
+    # reuse ssh password as sudo password
+    SUDO_PASS="$SSH_PASS"
   fi
 
   read -r -p "Debug logs on failure? (true/false) [false]: " DEBUG
@@ -353,7 +334,6 @@ preflight_ssh() {
   spinner_stop_ok "SSH login OK"
 }
 
-# ---------- Main action ----------
 configure_gre_ipv4() {
   info "--- Iran Server (Local) Configuration ---"
   prompt_inputs
@@ -364,15 +344,8 @@ configure_gre_ipv4() {
     cat <<'EOF'
 set -euo pipefail
 
-if ! command -v ip >/dev/null 2>&1; then
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y iproute2 >/dev/null 2>&1
-  else
-    echo "Missing dependency: ip (iproute2)" >&2
-    exit 20
-  fi
-fi
+# hard requirement: ip must exist (no apt install here)
+command -v ip >/dev/null 2>&1 || { echo "Missing dependency: ip (iproute2)" >&2; exit 20; }
 
 ip link show To_IR >/dev/null 2>&1 && ip tunnel del To_IR >/dev/null 2>&1 || true
 ip tunnel add To_IR mode gre remote <IP_IRAN> local <IP_KHAREJ> ttl 255
@@ -386,7 +359,7 @@ EOF
 
   spinner_start "Configuring Kharej server (remote GRE setup via sudo -i)"
   local out=""
-  if ! out="$(run_remote_capture "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_payload")"; then
+  if ! out="$(run_remote_payload_b64 "$KHAREJ_IP" "$SSH_PORT" "$SSH_USER" "$SSH_PASS" "$SUDO_PASS" "$remote_payload")"; then
     spinner_stop_fail "Configuring Kharej server (remote GRE setup via sudo -i)"
     if [[ "$DEBUG" == "true" ]]; then
       echo -e "${RED}Remote output (debug):${NC}"
